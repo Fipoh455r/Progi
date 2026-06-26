@@ -1,0 +1,16 @@
+apiVersion: v2
+name: localai
+description: LocalAI — локальный AI-агент без облака (Go, stdlib only)
+type: application
+version: 3.0.0
+appVersion: "3.0"
+keywords:
+  - ai
+  - llm
+  - ollama
+  - localai
+home: https://github.com/Fipoh455r/Progi
+sources:
+  - https://github.com/Fipoh455r/Progi
+maintainers:
+  - name: LocalAI

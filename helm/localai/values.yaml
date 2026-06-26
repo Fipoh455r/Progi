@@ -1,0 +1,130 @@
+# values.yaml — значения по умолчанию для Helm-чарта LocalAI v3.0
+
+# ── Образ ──────────────────────────────────────────────────────────────
+image:
+  repository: ghcr.io/fipoh455r/progi
+  tag: "3.0"
+  pullPolicy: IfNotPresent
+
+# ── Масштабирование ────────────────────────────────────────────────────
+replicaCount: 1
+
+# ── Сервис ─────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 8080
+
+# ── Ingress ────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: localai.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: localai-tls
+  #   hosts:
+  #     - localai.example.com
+
+# ── Постоянное хранилище (/app/data: сессии, RAG, пользователи) ────────
+persistence:
+  enabled: true
+  storageClass: ""       # "" = default StorageClass кластера
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  # Использовать существующий PVC вместо создания нового:
+  existingClaim: ""
+
+# ── Ресурсы контейнера ────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "1000m"
+    memory: "512Mi"
+
+# ── Конфигурация LocalAI ──────────────────────────────────────────────
+config:
+  # Языковая модель по умолчанию
+  model: "qwen2.5:0.5b"
+  # Порт веб-сервера (менять только при необходимости)
+  port: "8080"
+
+# ── Ollama ────────────────────────────────────────────────────────────
+ollama:
+  # URL единственной ноды
+  url: "http://ollama:11434"
+  # Балансировка нескольких нод (через запятую):
+  # nodes: "http://ollama-0:11434,http://ollama-1:11434"
+  nodes: ""
+
+# ── Авторизация ───────────────────────────────────────────────────────
+auth:
+  # JWT-секрет. Оставить "" — будет автосгенерирован и сохранён в data/jwt_secret.key
+  jwtSecret: ""
+
+# ── Whisper STT ───────────────────────────────────────────────────────
+whisper:
+  url: ""  # "" = не используется. Пример: http://whisper:8081
+
+# ── piper TTS ────────────────────────────────────────────────────────
+piper:
+  bin: ""     # "" = ищем в PATH (в образе должен быть установлен)
+  voice: "en_US-lessac-medium"
+  voicesDir: ""  # "" = data/voices
+
+# ── Метрики Prometheus ────────────────────────────────────────────────
+metrics:
+  enabled: true
+  # Если установлен Prometheus Operator — можно создать ServiceMonitor
+  serviceMonitor:
+    enabled: false
+    interval: "30s"
+    namespace: ""
+
+# ── ServiceAccount ────────────────────────────────────────────────────
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+# ── Probe-ы ──────────────────────────────────────────────────────────
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 30
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+# ── Дополнительные переменные окружения (произвольные) ────────────────
+extraEnv: []
+# - name: MY_VAR
+#   value: "my-value"
+
+# ── Pod-аннотации / метки ─────────────────────────────────────────────
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+podLabels: {}
+
+# ── Affinity / tolerations / nodeSelector ────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}

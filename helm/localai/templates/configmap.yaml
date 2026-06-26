@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "localai.fullname" . }}-config
+  labels:
+    {{- include "localai.labels" . | nindent 4 }}
+data:
+  LOCALAI_MODEL:            {{ .Values.config.model | quote }}
+  LOCALAI_PORT:             {{ .Values.config.port | quote }}
+  LOCALAI_DATA:             "/app/data"
+  OLLAMA_URL:               {{ .Values.ollama.url | quote }}
+  {{- if .Values.ollama.nodes }}
+  LOCALAI_OLLAMA_NODES:     {{ .Values.ollama.nodes | quote }}
+  {{- end }}
+  {{- if .Values.whisper.url }}
+  LOCALAI_WHISPER_URL:      {{ .Values.whisper.url | quote }}
+  {{- end }}
+  {{- if .Values.piper.bin }}
+  LOCALAI_PIPER_BIN:        {{ .Values.piper.bin | quote }}
+  {{- end }}
+  LOCALAI_PIPER_VOICE:      {{ .Values.piper.voice | quote }}
+  {{- if .Values.piper.voicesDir }}
+  LOCALAI_PIPER_VOICES_DIR: {{ .Values.piper.voicesDir | quote }}
+  {{- end }}
+  LOCALAI_METRICS_ENABLED:  {{ .Values.metrics.enabled | quote }}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 //go:embed static/index.html
@@ -19,7 +20,9 @@ const maxUploadSize = 10 << 20 // 10 MB
 
 // runServer запускает HTTP-сервер.
 func runServer(ollamaURL, defaultModel, port, dataDir string) {
-	client := NewOllamaClient(ollamaURL)
+	// ── Балансировщик нод Ollama ─────────────────────────────────────────
+	balancer := NewOllamaBalancer(ollamaURL)
+	client := balancer.Primary() // для RAG, compress и прочих одиночных вызовов
 
 	store, err := NewStorage(dataDir)
 	if err != nil {
@@ -30,6 +33,9 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	if err != nil {
 		log.Fatalf("RAG: %v", err)
 	}
+
+	// ── Метрики ──────────────────────────────────────────────────────────
+	metrics := NewMetrics(balancer)
 
 	// ── Авторизация ──────────────────────────────────────────────────────
 	userStore, err := NewUserStore(dataDir)
@@ -58,8 +64,11 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	piperVoice    := envOr("LOCALAI_PIPER_VOICE", "en_US-lessac-medium")
 	piperTTS := NewPiperTTS(piperBin, piperVoicesDir, piperVoice)
 
-	if !client.IsAvailable() {
+	if balancer.HealthyCount() == 0 {
 		fmt.Printf("%s[!] Ollama недоступен (%s). Запусти Docker.%s\n", colorYellow, ollamaURL, colorReset)
+	} else if balancer.TotalCount() > 1 {
+		fmt.Printf("%s[✓] Ollama балансировщик: %d/%d нод доступны%s\n",
+			colorGreen, balancer.HealthyCount(), balancer.TotalCount(), colorReset)
 	}
 	if !whisperClient.IsAvailable() {
 		fmt.Printf("%s[!] Whisper STT недоступен (%s). Голосовой ввод отключён.%s\n",
@@ -75,6 +84,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	}
 
 	mux := http.NewServeMux()
+	registerMetricsRoute(mux, metrics)
 
 	// ── Вспомогательная обёртка для защищённых маршрутов ────────────────
 	// protected применяет middleware авторизации и rate limiting
@@ -97,7 +107,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	})
 
 	// ── Авторизация (публичные маршруты) ─────────────────────────────────
-	registerAuthRoutes(mux, userStore, jwtSecret, loginLimiter)
+	registerAuthRoutes(mux, userStore, jwtSecret, loginLimiter, metrics)
 
 	// ── Health (публичный) ───────────────────────────────────────────────
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -287,7 +297,15 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			flusher.Flush()
 		}
 
-		tokenCh, errCh := client.ChatStreamWithTemp(ctx, msgs, model, temp)
+		// Метрики: считаем запрос и активное соединение
+		metrics.ChatReqs.Inc()
+		metrics.ActiveStart()
+		defer metrics.ActiveDone()
+		t0 := time.Now()
+
+		// Балансировщик: выбираем здоровую ноду для этого запроса
+		chatClient := balancer.Pick()
+		tokenCh, errCh := chatClient.ChatStreamWithTemp(ctx, msgs, model, temp)
 		var sb strings.Builder
 		for token := range tokenCh {
 			sb.WriteString(token)
@@ -295,6 +313,8 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		}
 
 		if err := <-errCh; err != nil {
+			metrics.ChatErrs.Inc()
+			balancer.ReportFailure(chatClient)
 			if ctx.Err() == nil {
 				writeEv(map[string]string{"error": err.Error()})
 				// Откат последнего user-сообщения
@@ -306,7 +326,11 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			return
 		}
 
+		balancer.ReportSuccess(chatClient)
+		metrics.ChatDuration.Observe(time.Since(t0).Seconds())
 		if resp := sb.String(); resp != "" {
+			// Примерно считаем токены: 1 токен ≈ 4 символа
+			metrics.Tokens.Add(int64(len([]rune(resp)) / 4))
 			_ = store.AppendAndSave(sess, Message{Role: "assistant", Content: resp})
 		}
 		writeEv(map[string]bool{"done": true})
@@ -364,10 +388,24 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		ctx := r.Context()
 		stepCh := make(chan AgentStep, 16)
 
-		// Запускаем агента в горутине
+		// Метрики
+		metrics.AgentReqs.Inc()
+		metrics.ActiveStart()
+		defer metrics.ActiveDone()
+		t0Agent := time.Now()
+
+		// Запускаем агента с выбранной нодой
+		agentClient := balancer.Pick()
 		answerCh := make(chan string, 1)
 		go func() {
-			answer, _ := RunAgent(ctx, client, sess.Messages, model, temp, stepCh)
+			answer, agentErr := RunAgent(ctx, agentClient, sess.Messages, model, temp, stepCh)
+			if agentErr != nil {
+				metrics.AgentErrs.Inc()
+				balancer.ReportFailure(agentClient)
+			} else {
+				balancer.ReportSuccess(agentClient)
+				metrics.AgentDuration.Observe(time.Since(t0Agent).Seconds())
+			}
 			answerCh <- answer
 		}()
 
@@ -423,10 +461,12 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		ctx := r.Context()
 		n, err := rag.AddDocument(ctx, header.Filename, text)
 		if err != nil {
+			metrics.UploadErrs.Inc()
 			http.Error(w, "ошибка индексации: "+err.Error(), 500)
 			return
 		}
 
+		metrics.Uploads.Inc()
 		jsonOK(w, map[string]any{
 			"name":   header.Filename,
 			"chunks": n,
@@ -526,13 +566,15 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerAudioRoutes(mux, whisperClient, piperTTS, jwtSecret)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v2.3 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.0 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:  POST /api/agent\n")
 	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
 	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Auth:   POST /api/auth/login | /api/auth/setup\n")
 	fmt.Printf("    Аудио:  POST /api/audio/transcriptions | /api/audio/speech\n")
+	fmt.Printf("    Метрики: GET /metrics  (Prometheus)\n")
+	fmt.Printf("    Ноды:   %d/%d Ollama нод доступны\n", balancer.HealthyCount(), balancer.TotalCount())
 	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)
 
 	if err := http.ListenAndServe(addr, withLogging(mux)); err != nil {
@@ -541,7 +583,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 }
 
 // registerAuthRoutes регистрирует публичные и аутентифицированные маршруты авторизации.
-func registerAuthRoutes(mux *http.ServeMux, users *UserStore, secret []byte, loginLimiter *RateLimiter) {
+func registerAuthRoutes(mux *http.ServeMux, users *UserStore, secret []byte, loginLimiter *RateLimiter, m *Metrics) {
 	// POST /api/auth/setup — создать первого admin (только если нет пользователей)
 	mux.HandleFunc("/api/auth/setup", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -601,6 +643,7 @@ func registerAuthRoutes(mux *http.ServeMux, users *UserStore, secret []byte, log
 		u, err := users.GetByUsername(body.Username)
 		if err != nil || u == nil || !VerifyPassword(u.PasswordHash, body.Password) {
 			// Одинаковая ошибка чтобы не раскрывать существование пользователя
+			m.LoginFail.Inc()
 			http.Error(w, `{"error":"неверный логин или пароль"}`, http.StatusUnauthorized)
 			return
 		}
@@ -609,6 +652,7 @@ func registerAuthRoutes(mux *http.ServeMux, users *UserStore, secret []byte, log
 			http.Error(w, "ошибка создания токена", 500)
 			return
 		}
+		m.LoginOK.Inc()
 		jsonOK(w, map[string]string{
 			"token":    token,
 			"username": u.Username,

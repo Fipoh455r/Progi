@@ -1,5 +1,4 @@
-// server.go — HTTP-сервер с веб-интерфейсом.
-// Веб-страница (static/index.html) зашита в бинарник через go:embed.
+// server.go — HTTP-сервер с веб-интерфейсом и персистентным хранением сессий.
 package main
 
 import (
@@ -9,80 +8,28 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 )
 
 //go:embed static/index.html
 var staticFiles embed.FS
 
-// chatSession хранит историю одного диалога.
-type chatSession struct {
-	History []Message
-}
-
-// sessionStore — потокобезопасное хранилище сессий.
-type sessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]*chatSession
-}
-
-func newSessionStore() *sessionStore {
-	return &sessionStore{sessions: make(map[string]*chatSession)}
-}
-
-// get возвращает сессию, создавая новую если её нет.
-func (s *sessionStore) get(id string) []Message {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess, ok := s.sessions[id]
-	if !ok {
-		sess = &chatSession{
-			History: []Message{{Role: "system", Content: systemPrompt}},
-		}
-		s.sessions[id] = sess
-	}
-	// Возвращаем копию, чтобы не было гонок при чтении
-	cp := make([]Message, len(sess.History))
-	copy(cp, sess.History)
-	return cp
-}
-
-// append добавляет сообщения в историю сессии.
-func (s *sessionStore) append(id string, msgs ...Message) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess, ok := s.sessions[id]
-	if !ok {
-		sess = &chatSession{
-			History: []Message{{Role: "system", Content: systemPrompt}},
-		}
-		s.sessions[id] = sess
-	}
-	sess.History = append(sess.History, msgs...)
-}
-
-// clear сбрасывает историю сессии до начального состояния.
-func (s *sessionStore) clear(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[id] = &chatSession{
-		History: []Message{{Role: "system", Content: systemPrompt}},
-	}
-}
-
-// runServer запускает HTTP-сервер с веб-интерфейсом.
-func runServer(ollamaURL, defaultModel, port string) {
+// runServer запускает HTTP-сервер.
+func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	client := NewOllamaClient(ollamaURL)
-	store := newSessionStore()
+
+	store, err := NewStorage(dataDir)
+	if err != nil {
+		log.Fatalf("Не удалось открыть хранилище данных: %v", err)
+	}
 
 	if !client.IsAvailable() {
 		fmt.Printf("%s[!] Ollama недоступен по %s%s\n", colorYellow, ollamaURL, colorReset)
-		fmt.Println("    Сервер запущен, но ответы работать не будут пока не поднят Ollama.")
+		fmt.Println("    Сервер запущен, ответы появятся когда Ollama будет готов.")
 	}
 
 	mux := http.NewServeMux()
 
-	// GET / — главная страница (из embed)
+	// ── Статика ────────────────────────────────────────────────────────────
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -97,50 +44,169 @@ func runServer(ollamaURL, defaultModel, port string) {
 		w.Write(data)
 	})
 
-	// GET /api/models — список моделей
+	// ── Модели ─────────────────────────────────────────────────────────────
 	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
 		models, err := client.ListModels()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(models)
+		jsonOK(w, models)
 	})
 
-	// POST /api/chat — SSE-поток токенов
+	// ── Список сессий ──────────────────────────────────────────────────────
+	// GET /api/sessions
+	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		list, err := store.List()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if list == nil {
+			list = []SessionMeta{}
+		}
+		jsonOK(w, list)
+	})
+
+	// ── Операции с конкретной сессией ──────────────────────────────────────
+	// GET    /api/sessions/{id}  — загрузить сессию (с историей)
+	// PATCH  /api/sessions/{id}  — изменить настройки (title, model, temp, prompt)
+	// DELETE /api/sessions/{id}  — удалить
+	mux.HandleFunc("/api/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
+		id = strings.TrimSuffix(id, "/")
+		if id == "" {
+			http.Error(w, "missing session id", 400)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			sess, err := store.Load(id)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			if sess == nil {
+				http.NotFound(w, r)
+				return
+			}
+			jsonOK(w, sess)
+
+		case http.MethodPatch:
+			sess, err := store.Load(id)
+			if err != nil || sess == nil {
+				http.Error(w, "session not found", 404)
+				return
+			}
+			var patch struct {
+				Title        *string  `json:"title"`
+				Model        *string  `json:"model"`
+				Temperature  *float64 `json:"temperature"`
+				SystemPrompt *string  `json:"system_prompt"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				http.Error(w, "bad request", 400)
+				return
+			}
+			if patch.Title != nil {
+				sess.Title = *patch.Title
+			}
+			if patch.Model != nil {
+				sess.Settings.Model = *patch.Model
+			}
+			if patch.Temperature != nil {
+				sess.Settings.Temperature = *patch.Temperature
+			}
+			if patch.SystemPrompt != nil {
+				sess.Settings.SystemPrompt = *patch.SystemPrompt
+				// Обновляем системное сообщение в истории
+				for i, m := range sess.Messages {
+					if m.Role == "system" {
+						sess.Messages[i].Content = *patch.SystemPrompt
+						break
+					}
+				}
+			}
+			if err := store.Save(sess); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			jsonOK(w, sess.SessionMeta)
+
+		case http.MethodDelete:
+			if err := store.Delete(id); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			jsonOK(w, map[string]bool{"ok": true})
+
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	})
+
+	// ── Чат (SSE streaming) ────────────────────────────────────────────────
+	// POST /api/chat
 	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			http.Error(w, "method not allowed", 405)
 			return
 		}
 
 		var body struct {
-			Message   string `json:"message"`
-			Model     string `json:"model"`
-			SessionID string `json:"session_id"`
+			Message   string  `json:"message"`
+			Model     string  `json:"model"`
+			SessionID string  `json:"session_id"`
+			Temp      float64 `json:"temperature"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			http.Error(w, "bad request: "+err.Error(), 400)
 			return
 		}
-
 		if strings.TrimSpace(body.Message) == "" {
-			http.Error(w, "message is empty", http.StatusBadRequest)
+			http.Error(w, "message is empty", 400)
 			return
-		}
-		if body.Model == "" {
-			body.Model = defaultModel
 		}
 		if body.SessionID == "" {
 			body.SessionID = "default"
 		}
 
-		// Добавляем сообщение пользователя в историю
-		store.append(body.SessionID, Message{Role: "user", Content: body.Message})
-		history := store.get(body.SessionID)
+		// Загружаем или создаём сессию
+		sess, err := store.GetOrCreate(body.SessionID, defaultModel, "")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
 
-		// SSE-заголовки
+		// Модель: приоритет запроса > настройки сессии > дефолт сервера
+		model := body.Model
+		if model == "" {
+			model = sess.Settings.Model
+		}
+		if model == "" {
+			model = defaultModel
+		}
+
+		// Температура: из запроса или из настроек сессии
+		temp := body.Temp
+		if temp == 0 {
+			temp = sess.Settings.Temperature
+		}
+		if temp == 0 {
+			temp = 0.7
+		}
+
+		// Добавляем сообщение пользователя в историю
+		if err := store.AppendAndSave(sess, Message{Role: "user", Content: body.Message}); err != nil {
+			log.Printf("warn: не удалось сохранить сообщение: %v", err)
+		}
+
+		// SSE заголовки
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -148,17 +214,12 @@ func runServer(ollamaURL, defaultModel, port string) {
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			http.Error(w, "streaming not supported", 500)
 			return
 		}
 
-		// Используем контекст запроса — когда клиент закрывает соединение,
-		// контекст отменяется и ChatStream завершается.
 		ctx := r.Context()
-
-		tokenCh, errCh := client.ChatStream(ctx, history, body.Model)
-
-		var fullResponse strings.Builder
+		tokenCh, errCh := client.ChatStreamWithTemp(ctx, sess.Messages, model, temp)
 
 		writeEvent := func(v any) {
 			data, _ := json.Marshal(v)
@@ -166,57 +227,71 @@ func runServer(ollamaURL, defaultModel, port string) {
 			flusher.Flush()
 		}
 
+		var fullResp strings.Builder
 		for token := range tokenCh {
-			fullResponse.WriteString(token)
+			fullResp.WriteString(token)
 			writeEvent(map[string]string{"token": token})
 		}
 
 		if err := <-errCh; err != nil {
-			// Не репортим ошибку отменённого контекста (клиент ушёл)
 			if ctx.Err() == nil {
 				writeEvent(map[string]string{"error": err.Error()})
-				// Убираем неудачное сообщение пользователя из истории
-				store.clear(body.SessionID)
-				store.append(body.SessionID,
-					history[1:len(history)-1]...) // восстанавливаем без последнего user msg
+				// Откатываем последнее user-сообщение
+				if len(sess.Messages) > 0 {
+					sess.Messages = sess.Messages[:len(sess.Messages)-1]
+					_ = store.Save(sess)
+				}
 			}
 			return
 		}
 
 		// Сохраняем ответ ассистента
-		if resp := fullResponse.String(); resp != "" {
-			store.append(body.SessionID, Message{Role: "assistant", Content: resp})
+		resp := fullResp.String()
+		if resp != "" {
+			if err := store.AppendAndSave(sess, Message{Role: "assistant", Content: resp}); err != nil {
+				log.Printf("warn: не удалось сохранить ответ: %v", err)
+			}
 		}
 
 		writeEvent(map[string]bool{"done": true})
 	})
 
-	// POST /api/clear — сброс истории сессии
+	// ── Очистить историю ───────────────────────────────────────────────────
 	mux.HandleFunc("/api/clear", func(w http.ResponseWriter, r *http.Request) {
 		sid := r.URL.Query().Get("session")
 		if sid == "" {
 			sid = "default"
 		}
-		store.clear(sid)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"ok":true}`))
+		sess, _ := store.Load(sid)
+		if sess != nil {
+			prompt := sess.Settings.SystemPrompt
+			if prompt == "" {
+				prompt = systemPrompt
+			}
+			sess.Messages = []Message{{Role: "system", Content: prompt}}
+			sess.Title = "Новый чат"
+			_ = store.Save(sess)
+		}
+		jsonOK(w, map[string]bool{"ok": true})
 	})
 
-	// Health-check
+	// ── Health-check ───────────────────────────────────────────────────────
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ok := client.IsAvailable()
-		status := http.StatusOK
 		if !ok {
-			status = http.StatusServiceUnavailable
+			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
 		fmt.Fprintf(w, `{"ollama":%v}`, ok)
 	})
 
+	// OpenAI-совместимый API (/v1/models, /v1/chat/completions)
+	registerOpenAIRoutes(mux, client, defaultModel)
+
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI веб-сервер запущен%s\n", colorGreen, colorReset)
-	fmt.Printf("    Открой: %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
+	fmt.Printf("%s[✓] LocalAI v1.2 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("    Веб:   %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
+	fmt.Printf("    Данные: %s%s%s\n", colorGray, dataDir, colorReset)
 	fmt.Printf("    Модель: %s%s%s\n\n", colorYellow, defaultModel, colorReset)
 
 	if err := http.ListenAndServe(addr, withLogging(mux)); err != nil {
@@ -224,15 +299,18 @@ func runServer(ollamaURL, defaultModel, port string) {
 	}
 }
 
-// withLogging — простой middleware для логирования запросов.
+// ── Вспомогательные функции ────────────────────────────────────────────────
+
+func jsonOK(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Не логируем SSE-запросы и health-check (шумят)
 		if r.URL.Path != "/api/chat" && r.URL.Path != "/health" {
 			log.Printf("%s %s", r.Method, r.URL.Path)
 		}
 		next.ServeHTTP(w, r)
 	})
 }
-
-

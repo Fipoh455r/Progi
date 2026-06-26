@@ -23,6 +23,7 @@ func main() {
 	ollamaURL := flag.String("ollama", envOr("OLLAMA_URL", "http://localhost:11434"), "URL Ollama API")
 	model := flag.String("model", envOr("LOCALAI_MODEL", "qwen2.5:0.5b"), "Языковая модель")
 	port := flag.String("port", envOr("LOCALAI_PORT", "8080"), "Порт веб-сервера")
+	dataDir := flag.String("data", envOr("LOCALAI_DATA", "./data"), "Каталог для хранения данных")
 	flag.Usage = printHelp
 	flag.Parse()
 
@@ -37,7 +38,7 @@ func main() {
 		runChat(*ollamaURL, *model)
 
 	case "serve", "server", "web":
-		runServer(*ollamaURL, *model, *port)
+		runServer(*ollamaURL, *model, *port, *dataDir)
 
 	case "models":
 		runListModels(*ollamaURL)

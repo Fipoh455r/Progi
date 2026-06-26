@@ -36,6 +36,9 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /localai .
 
+# Создаём директорию для данных (история чатов)
+RUN mkdir -p /app/data
+
 # Порт веб-интерфейса
 EXPOSE 8080
 
@@ -43,6 +46,10 @@ EXPOSE 8080
 ENV OLLAMA_URL=http://ollama:11434
 ENV LOCALAI_MODEL=qwen2.5:0.5b
 ENV LOCALAI_PORT=8080
+ENV LOCALAI_DATA=/app/data
+
+# /app/data монтируется как volume снаружи для сохранения истории
+VOLUME ["/app/data"]
 
 # Запускаем в режиме веб-сервера
 CMD ["./localai", "serve"]

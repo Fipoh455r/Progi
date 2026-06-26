@@ -100,14 +100,18 @@ func (c *OllamaClient) IsAvailable() bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// ChatStream отправляет сообщения в /api/chat и возвращает канал токенов.
-//
-// Токены приходят по одному по мере генерации.
-// Канал закрывается когда генерация завершена или произошла ошибка.
-// Ошибки передаются через errCh (буферизованный канал размером 1).
-//
-// Контекст ctx позволяет отменить запрос (например, при закрытии соединения).
+// ChatStream — обёртка с температурой по умолчанию (0.7).
 func (c *OllamaClient) ChatStream(ctx context.Context, messages []Message, model string) (<-chan string, <-chan error) {
+	return c.chatStreamImpl(ctx, messages, model, 0.7)
+}
+
+// ChatStreamWithTemp — стриминг с указанной температурой.
+func (c *OllamaClient) ChatStreamWithTemp(ctx context.Context, messages []Message, model string, temperature float64) (<-chan string, <-chan error) {
+	return c.chatStreamImpl(ctx, messages, model, temperature)
+}
+
+// chatStreamImpl — внутренняя реализация стримингового чата.
+func (c *OllamaClient) chatStreamImpl(ctx context.Context, messages []Message, model string, temperature float64) (<-chan string, <-chan error) {
 	tokenCh := make(chan string, 64)
 	errCh := make(chan error, 1)
 
@@ -120,7 +124,7 @@ func (c *OllamaClient) ChatStream(ctx context.Context, messages []Message, model
 			Messages: messages,
 			Stream:   true,
 			Options: chatOpts{
-				Temperature: 0.7,
+				Temperature: temperature,
 			},
 		})
 		if err != nil {

@@ -1,0 +1,78 @@
+version: "3.8"
+
+# ============================================================
+#  LocalAI Go — полный стек: Go-приложение + Ollama
+#
+#  Запуск:  docker compose -f docker-compose.goapp.yml up -d
+#  Открыть: http://localhost:8080
+#
+#  Отличия от docker-compose.yml:
+#   - Веб-интерфейс написан на Go (один бинарник, ~15 MB)
+#   - Нет Open WebUI — своя встроенная страница
+#   - Меньше RAM (нет Node.js / Python)
+# ============================================================
+
+services:
+
+  # --- Ollama: движок для запуска LLM ---
+  ollama:
+    image: ollama/ollama:latest
+    container_name: localai-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_NUM_PARALLEL=1
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:11434/api/tags"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # --- LocalAI Go: собирается из исходников ---
+  localai:
+    build:
+      context: ./go
+      dockerfile: Dockerfile
+    container_name: localai-app
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - LOCALAI_MODEL=qwen2.5:0.5b
+      - LOCALAI_PORT=8080
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # --- Загрузчик модели (запускается один раз) ---
+  model-loader:
+    image: curlimages/curl:latest
+    container_name: localai-model-loader
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        echo 'Загрузка модели qwen2.5:0.5b...' &&
+        curl -s -X POST http://ollama:11434/api/pull
+          -H 'Content-Type: application/json'
+          -d '{\"name\": \"qwen2.5:0.5b\"}'
+          --no-buffer &&
+        echo 'Готово!'
+      "
+    restart: "no"
+
+volumes:
+  ollama-models:
+    driver: local

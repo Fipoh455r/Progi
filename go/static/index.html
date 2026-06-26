@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LocalAI</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:#0d1117;color:#c9d1d9;height:100vh;
+  display:flex;flex-direction:column;overflow:hidden
+}
+
+/* ── Шапка ── */
+header{
+  background:#161b22;border-bottom:1px solid #30363d;
+  padding:10px 18px;display:flex;align-items:center;
+  justify-content:space-between;flex-shrink:0;gap:10px
+}
+.logo{font-size:1.1rem;font-weight:700;color:#58a6ff;letter-spacing:2px;white-space:nowrap}
+.logo span{color:#f78166}
+
+.hcontrols{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+select{
+  background:#21262d;color:#c9d1d9;
+  border:1px solid #30363d;padding:5px 8px;
+  border-radius:6px;font-size:0.82rem;cursor:pointer;max-width:220px
+}
+select:focus{outline:none;border-color:#58a6ff}
+
+.btn{
+  background:#21262d;color:#c9d1d9;
+  border:1px solid #30363d;padding:5px 12px;
+  border-radius:6px;cursor:pointer;font-size:0.82rem;
+  transition:background .15s,border-color .15s;white-space:nowrap
+}
+.btn:hover{background:#30363d;border-color:#58a6ff}
+.btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.btn.primary:hover{background:#388bfd}
+.btn:disabled{opacity:.5;cursor:default}
+
+/* ── Сообщения ── */
+#messages{
+  flex:1;overflow-y:auto;padding:20px 18px;
+  display:flex;flex-direction:column;gap:18px
+}
+
+.msg{display:flex;gap:10px;max-width:860px;animation:fadeUp .25s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+.msg.user{align-self:flex-end;flex-direction:row-reverse}
+
+.avatar{
+  width:32px;height:32px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-size:.9rem;flex-shrink:0;margin-top:2px
+}
+.msg.user .avatar{background:#1f6feb}
+.msg.ai   .avatar{background:#238636}
+
+.bubble{
+  background:#161b22;border:1px solid #30363d;
+  border-radius:10px;padding:11px 15px;
+  max-width:75%;line-height:1.65;font-size:.93rem;
+  word-break:break-word
+}
+.msg.user .bubble{background:#1c2e4a;border-color:#1f6feb}
+
+/* Код внутри пузыря */
+.bubble pre{
+  background:#0d1117;border:1px solid #30363d;
+  border-radius:6px;padding:10px 12px;margin:8px 0;
+  overflow-x:auto;font-size:.82rem
+}
+.bubble code{font-family:'Consolas','Fira Code',monospace;font-size:.85em}
+.bubble p{margin-bottom:6px}.bubble p:last-child{margin-bottom:0}
+.bubble strong{color:#e6edf3}
+.bubble ul,.bubble ol{padding-left:18px;margin:6px 0}
+.bubble li{margin-bottom:3px}
+
+/* Мигающий курсор при генерации */
+.cursor{
+  display:inline-block;width:2px;height:1em;
+  background:#58a6ff;vertical-align:text-bottom;
+  animation:blink .7s steps(1) infinite
+}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+
+/* Индикатор «печатает…» */
+.typing{display:flex;gap:4px;padding:6px 0}
+.typing i{
+  width:7px;height:7px;background:#58a6ff;border-radius:50%;
+  animation:bounce 1.3s infinite ease-in-out
+}
+.typing i:nth-child(1){animation-delay:-.32s}
+.typing i:nth-child(2){animation-delay:-.16s}
+@keyframes bounce{0%,80%,100%{transform:scale(0)}40%{transform:scale(1)}}
+
+/* Статусная строка */
+#status{
+  font-size:.75rem;color:#8b949e;
+  text-align:center;padding:3px 0;background:#161b22;
+  border-top:1px solid #21262d;flex-shrink:0
+}
+
+/* ── Поле ввода ── */
+#input-row{
+  background:#161b22;border-top:1px solid #30363d;
+  padding:12px 18px;display:flex;gap:8px;align-items:flex-end;flex-shrink:0
+}
+#input{
+  flex:1;background:#21262d;color:#c9d1d9;
+  border:1px solid #30363d;border-radius:8px;
+  padding:9px 13px;font-size:.93rem;
+  outline:none;resize:none;min-height:40px;max-height:130px;
+  font-family:inherit;line-height:1.5
+}
+#input::placeholder{color:#484f58}
+#input:focus{border-color:#58a6ff;box-shadow:0 0 0 2px rgba(88,166,255,.15)}
+#send{padding:9px 16px;font-size:1rem}
+
+/* Скроллбар */
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:#0d1117}
+::-webkit-scrollbar-thumb{background:#30363d;border-radius:3px}
+
+/* Адаптив */
+@media(max-width:600px){
+  .bubble{max-width:92%}
+  .hcontrols select{max-width:140px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">⚡ LOCAL<span>AI</span></div>
+  <div class="hcontrols">
+    <select id="model-sel" title="Выбор модели"></select>
+    <button class="btn" onclick="clearChat()" title="Очистить историю">Новый чат</button>
+  </div>
+</header>
+
+<div id="messages">
+  <div class="msg ai">
+    <div class="avatar">🤖</div>
+    <div class="bubble">
+      Привет! Я <strong>LocalAI</strong> — твой локальный AI-ассистент.<br>
+      Работаю полностью без интернета. Задай любой вопрос!
+    </div>
+  </div>
+</div>
+
+<div id="status">Подключение к Ollama...</div>
+
+<div id="input-row">
+  <textarea id="input" placeholder="Введи сообщение… (Enter — отправить, Shift+Enter — новая строка)" rows="1"></textarea>
+  <button class="btn primary" id="send" onclick="send()">➤</button>
+</div>
+
+<script>
+// ── Состояние ──
+const sid = 'sid_' + Math.random().toString(36).slice(2, 10);
+let busy = false;
+
+// ── Загрузка моделей ──
+async function loadModels() {
+  try {
+    const r = await fetch('/api/models');
+    const models = await r.json();
+    const sel = document.getElementById('model-sel');
+    sel.innerHTML = '';
+    if (!models || models.length === 0) {
+      sel.innerHTML = '<option value="qwen2.5:0.5b">qwen2.5:0.5b</option>';
+      setStatus('⚠ Нет моделей. Запусти: localai pull qwen2.5:0.5b');
+      return;
+    }
+    models.forEach(m => {
+      const mb = Math.round(m.size / 1024 / 1024);
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      opt.textContent = m.name + ' (' + mb + ' MB)';
+      sel.appendChild(opt);
+    });
+    setStatus('✓ Ollama подключён · ' + models.length + ' модел' + plural(models.length, 'ь', 'и', 'ей'));
+  } catch (e) {
+    setStatus('✗ Ollama недоступен — запусти Docker');
+  }
+}
+
+function plural(n, one, few, many) {
+  const mod10 = n % 10, mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+  return many;
+}
+
+function setStatus(txt) {
+  document.getElementById('status').textContent = txt;
+}
+
+// ── Рендер текста (лёгкий markdown) ──
+function render(raw) {
+  // Экранируем HTML
+  let t = raw
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+
+  // Блоки кода ```lang\n...\n```
+  t = t.replace(/```[\w]*\n?([\s\S]*?)```/g, (_, code) =>
+    '<pre><code>' + code.trimEnd() + '</code></pre>');
+
+  // Инлайн-код `...`
+  t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+  // **жирный**
+  t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+  // Строки → абзацы (двойной перевод = новый абзац)
+  t = t.replace(/\n\n+/g, '</p><p>');
+  t = t.replace(/\n/g, '<br>');
+  return '<p>' + t + '</p>';
+}
+
+// ── Добавить пузырь ──
+function addBubble(role, html) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + (role === 'user' ? 'user' : 'ai');
+
+  const av = document.createElement('div');
+  av.className = 'avatar';
+  av.textContent = role === 'user' ? '👤' : '🤖';
+
+  const bub = document.createElement('div');
+  bub.className = 'bubble';
+  bub.innerHTML = html;
+
+  wrap.appendChild(av);
+  wrap.appendChild(bub);
+
+  const box = document.getElementById('messages');
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
+  return bub;
+}
+
+function scrollBottom() {
+  const box = document.getElementById('messages');
+  box.scrollTop = box.scrollHeight;
+}
+
+// ── Отправка сообщения ──
+async function send() {
+  if (busy) return;
+  const inp = document.getElementById('input');
+  const text = inp.value.trim();
+  if (!text) return;
+
+  const model = document.getElementById('model-sel').value || 'qwen2.5:0.5b';
+
+  inp.value = '';
+  inp.style.height = 'auto';
+  busy = true;
+  document.getElementById('send').disabled = true;
+
+  // Пузырь пользователя
+  addBubble('user', render(text));
+
+  // Индикатор загрузки
+  const aiBub = addBubble('ai', '<div class="typing"><i></i><i></i><i></i></div>');
+  let started = false;
+  let rawBuf = '';
+
+  try {
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({message: text, model, session_id: sid})
+    });
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+
+      buf += dec.decode(value, {stream: true});
+      const lines = buf.split('\n');
+      buf = lines.pop(); // последняя неполная строка
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch { continue; }
+
+        if (data.error) {
+          aiBub.innerHTML = '<span style="color:#f85149">⚠ ' + data.error + '</span>';
+          break;
+        }
+
+        if (data.done) break;
+
+        if (data.token !== undefined) {
+          if (!started) {
+            aiBub.innerHTML = '';
+            started = true;
+          }
+          rawBuf += data.token;
+          // Обновляем рендер каждые ~30 символов для производительности
+          aiBub.innerHTML = render(rawBuf) + '<span class="cursor"></span>';
+          scrollBottom();
+        }
+      }
+    }
+
+    // Финальный рендер без курсора
+    if (started) aiBub.innerHTML = render(rawBuf);
+
+  } catch (e) {
+    aiBub.innerHTML = '<span style="color:#f85149">⚠ Ошибка соединения: ' + e.message + '</span>';
+  }
+
+  busy = false;
+  document.getElementById('send').disabled = false;
+  inp.focus();
+}
+
+// ── Очистить чат ──
+async function clearChat() {
+  await fetch('/api/clear?session=' + sid, {method:'POST'}).catch(() => {});
+  const box = document.getElementById('messages');
+  box.innerHTML = `
+    <div class="msg ai">
+      <div class="avatar">🤖</div>
+      <div class="bubble">История очищена. Чем могу помочь?</div>
+    </div>`;
+}
+
+// ── Клавиатура ──
+document.getElementById('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+
+// Авто-высота textarea
+document.getElementById('input').addEventListener('input', function () {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 130) + 'px';
+});
+
+// ── Старт ──
+loadModels();
+setInterval(loadModels, 30000); // обновляем список моделей каждые 30с
+</script>
+</body>
+</html>

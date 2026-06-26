@@ -1,10 +1,11 @@
-// server.go — HTTP-сервер с веб-интерфейсом и персистентным хранением сессий.
+// server.go — HTTP-сервер v2.0: чат + агент + RAG + сжатие контекста.
 package main
 
 import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -13,186 +14,163 @@ import (
 //go:embed static/index.html
 var staticFiles embed.FS
 
+const maxUploadSize = 10 << 20 // 10 MB
+
 // runServer запускает HTTP-сервер.
 func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	client := NewOllamaClient(ollamaURL)
 
 	store, err := NewStorage(dataDir)
 	if err != nil {
-		log.Fatalf("Не удалось открыть хранилище данных: %v", err)
+		log.Fatalf("Хранилище: %v", err)
+	}
+
+	rag, err := NewRAG(dataDir+"/rag", client, "nomic-embed-text")
+	if err != nil {
+		log.Fatalf("RAG: %v", err)
 	}
 
 	if !client.IsAvailable() {
-		fmt.Printf("%s[!] Ollama недоступен по %s%s\n", colorYellow, ollamaURL, colorReset)
-		fmt.Println("    Сервер запущен, ответы появятся когда Ollama будет готов.")
+		fmt.Printf("%s[!] Ollama недоступен (%s). Запусти Docker.%s\n", colorYellow, ollamaURL, colorReset)
 	}
 
 	mux := http.NewServeMux()
 
-	// ── Статика ────────────────────────────────────────────────────────────
+	// ── Главная страница ─────────────────────────────────────────────────
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
-		data, err := staticFiles.ReadFile("static/index.html")
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
+		data, _ := staticFiles.ReadFile("static/index.html")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(data)
 	})
 
-	// ── Модели ─────────────────────────────────────────────────────────────
+	// ── Модели ──────────────────────────────────────────────────────────
 	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
 		models, err := client.ListModels()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			http.Error(w, err.Error(), 503)
 			return
 		}
 		jsonOK(w, models)
 	})
 
-	// ── Список сессий ──────────────────────────────────────────────────────
-	// GET /api/sessions
+	// ── Инструменты агента ───────────────────────────────────────────────
+	mux.HandleFunc("/api/tools", func(w http.ResponseWriter, r *http.Request) {
+		type toolInfo struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			ArgsSchema  string `json:"args_schema"`
+		}
+		var tools []toolInfo
+		for _, t := range AllTools {
+			tools = append(tools, toolInfo{t.Name, t.Description, t.ArgsSchema})
+		}
+		jsonOK(w, tools)
+	})
+
+	// ── Сессии ──────────────────────────────────────────────────────────
 	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		list, err := store.List()
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
+		list, _ := store.List()
 		if list == nil {
 			list = []SessionMeta{}
 		}
 		jsonOK(w, list)
 	})
 
-	// ── Операции с конкретной сессией ──────────────────────────────────────
-	// GET    /api/sessions/{id}  — загрузить сессию (с историей)
-	// PATCH  /api/sessions/{id}  — изменить настройки (title, model, temp, prompt)
-	// DELETE /api/sessions/{id}  — удалить
 	mux.HandleFunc("/api/sessions/", func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/api/sessions/")
-		id = strings.TrimSuffix(id, "/")
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/sessions/"), "/")
 		if id == "" {
-			http.Error(w, "missing session id", 400)
+			http.Error(w, "missing id", 400)
 			return
 		}
-
 		switch r.Method {
 		case http.MethodGet:
-			sess, err := store.Load(id)
-			if err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
+			sess, _ := store.Load(id)
 			if sess == nil {
 				http.NotFound(w, r)
 				return
 			}
 			jsonOK(w, sess)
-
 		case http.MethodPatch:
-			sess, err := store.Load(id)
-			if err != nil || sess == nil {
-				http.Error(w, "session not found", 404)
+			sess, _ := store.Load(id)
+			if sess == nil {
+				http.Error(w, "not found", 404)
 				return
 			}
-			var patch struct {
+			var p struct {
 				Title        *string  `json:"title"`
 				Model        *string  `json:"model"`
 				Temperature  *float64 `json:"temperature"`
 				SystemPrompt *string  `json:"system_prompt"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 				http.Error(w, "bad request", 400)
 				return
 			}
-			if patch.Title != nil {
-				sess.Title = *patch.Title
+			if p.Title != nil {
+				sess.Title = *p.Title
 			}
-			if patch.Model != nil {
-				sess.Settings.Model = *patch.Model
+			if p.Model != nil {
+				sess.Settings.Model = *p.Model
 			}
-			if patch.Temperature != nil {
-				sess.Settings.Temperature = *patch.Temperature
+			if p.Temperature != nil {
+				sess.Settings.Temperature = *p.Temperature
 			}
-			if patch.SystemPrompt != nil {
-				sess.Settings.SystemPrompt = *patch.SystemPrompt
-				// Обновляем системное сообщение в истории
+			if p.SystemPrompt != nil {
+				sess.Settings.SystemPrompt = *p.SystemPrompt
 				for i, m := range sess.Messages {
 					if m.Role == "system" {
-						sess.Messages[i].Content = *patch.SystemPrompt
+						sess.Messages[i].Content = *p.SystemPrompt
 						break
 					}
 				}
 			}
-			if err := store.Save(sess); err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
+			_ = store.Save(sess)
 			jsonOK(w, sess.SessionMeta)
-
 		case http.MethodDelete:
-			if err := store.Delete(id); err != nil {
-				http.Error(w, err.Error(), 500)
-				return
-			}
+			_ = store.Delete(id)
 			jsonOK(w, map[string]bool{"ok": true})
-
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
 	})
 
-	// ── Чат (SSE streaming) ────────────────────────────────────────────────
-	// POST /api/chat
+	// ── Обычный чат (SSE) ────────────────────────────────────────────────
+	// POST /api/chat  {message, model, session_id, temperature, use_rag}
 	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-
 		var body struct {
 			Message   string  `json:"message"`
 			Model     string  `json:"model"`
 			SessionID string  `json:"session_id"`
 			Temp      float64 `json:"temperature"`
+			UseRAG    bool    `json:"use_rag"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "bad request: "+err.Error(), 400)
-			return
-		}
-		if strings.TrimSpace(body.Message) == "" {
-			http.Error(w, "message is empty", 400)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Message) == "" {
+			http.Error(w, "bad request", 400)
 			return
 		}
 		if body.SessionID == "" {
 			body.SessionID = "default"
 		}
 
-		// Загружаем или создаём сессию
 		sess, err := store.GetOrCreate(body.SessionID, defaultModel, "")
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 
-		// Модель: приоритет запроса > настройки сессии > дефолт сервера
-		model := body.Model
-		if model == "" {
-			model = sess.Settings.Model
-		}
-		if model == "" {
-			model = defaultModel
-		}
-
-		// Температура: из запроса или из настроек сессии
+		model := firstNonEmpty(body.Model, sess.Settings.Model, defaultModel)
 		temp := body.Temp
 		if temp == 0 {
 			temp = sess.Settings.Temperature
@@ -201,42 +179,63 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			temp = 0.7
 		}
 
-		// Добавляем сообщение пользователя в историю
-		if err := store.AppendAndSave(sess, Message{Role: "user", Content: body.Message}); err != nil {
-			log.Printf("warn: не удалось сохранить сообщение: %v", err)
+		// Сохраняем сообщение пользователя
+		_ = store.AppendAndSave(sess, Message{Role: "user", Content: body.Message})
+
+		// Сжимаем историю если слишком длинная (экономия токенов)
+		ctx := r.Context()
+		compressed, wasCompressed, _ := CompressHistory(ctx, client, sess.Messages, model)
+		if wasCompressed {
+			sess.Messages = compressed
+			_ = store.Save(sess)
 		}
 
-		// SSE заголовки
+		// RAG: инжектируем контекст из документов
+		msgs := sess.Messages
+		if body.UseRAG || len(rag.ListDocs()) > 0 {
+			results, err := rag.Search(ctx, body.Message, 4)
+			if err == nil && len(results) > 0 {
+				ragCtx := BuildContextString(results)
+				if ragCtx != "" {
+					// Вставляем контекст как system-сообщение перед последним user
+					injected := make([]Message, len(msgs))
+					copy(injected, msgs)
+					// Добавляем перед последним сообщением
+					last := injected[len(injected)-1]
+					injected[len(injected)-1] = Message{
+						Role:    "system",
+						Content: ragCtx,
+					}
+					injected = append(injected, last)
+					msgs = injected
+				}
+			}
+		}
+
+		// SSE-заголовки
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
+		flusher := w.(http.Flusher)
 
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming not supported", 500)
-			return
-		}
-
-		ctx := r.Context()
-		tokenCh, errCh := client.ChatStreamWithTemp(ctx, sess.Messages, model, temp)
-
-		writeEvent := func(v any) {
+		writeEv := func(v any) {
 			data, _ := json.Marshal(v)
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
 
-		var fullResp strings.Builder
+		tokenCh, errCh := client.ChatStreamWithTemp(ctx, msgs, model, temp)
+		var sb strings.Builder
 		for token := range tokenCh {
-			fullResp.WriteString(token)
-			writeEvent(map[string]string{"token": token})
+			sb.WriteString(token)
+			writeEv(map[string]string{"token": token})
 		}
 
 		if err := <-errCh; err != nil {
 			if ctx.Err() == nil {
-				writeEvent(map[string]string{"error": err.Error()})
-				// Откатываем последнее user-сообщение
+				writeEv(map[string]string{"error": err.Error()})
+				// Откат последнего user-сообщения
 				if len(sess.Messages) > 0 {
 					sess.Messages = sess.Messages[:len(sess.Messages)-1]
 					_ = store.Save(sess)
@@ -245,18 +244,167 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			return
 		}
 
-		// Сохраняем ответ ассистента
-		resp := fullResp.String()
-		if resp != "" {
-			if err := store.AppendAndSave(sess, Message{Role: "assistant", Content: resp}); err != nil {
-				log.Printf("warn: не удалось сохранить ответ: %v", err)
-			}
+		if resp := sb.String(); resp != "" {
+			_ = store.AppendAndSave(sess, Message{Role: "assistant", Content: resp})
 		}
-
-		writeEvent(map[string]bool{"done": true})
+		writeEv(map[string]bool{"done": true})
 	})
 
-	// ── Очистить историю ───────────────────────────────────────────────────
+	// ── Агент (SSE с шагами) ─────────────────────────────────────────────
+	// POST /api/agent  {message, model, session_id, temperature}
+	// Возвращает поток AgentStep как SSE
+	mux.HandleFunc("/api/agent", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Message   string  `json:"message"`
+			Model     string  `json:"model"`
+			SessionID string  `json:"session_id"`
+			Temp      float64 `json:"temperature"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Message) == "" {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		if body.SessionID == "" {
+			body.SessionID = "agent_" + body.SessionID
+		}
+
+		sess, err := store.GetOrCreate(body.SessionID, defaultModel, agentSystemPrompt())
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		model := firstNonEmpty(body.Model, sess.Settings.Model, defaultModel)
+		temp := body.Temp
+		if temp == 0 {
+			temp = 0.4 // агент работает точнее при низкой температуре
+		}
+
+		// Добавляем вопрос в историю
+		_ = store.AppendAndSave(sess, Message{Role: "user", Content: body.Message})
+
+		// SSE-заголовки
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher := w.(http.Flusher)
+
+		writeStep := func(step AgentStep) {
+			data, _ := json.Marshal(step)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+
+		ctx := r.Context()
+		stepCh := make(chan AgentStep, 16)
+
+		// Запускаем агента в горутине
+		answerCh := make(chan string, 1)
+		go func() {
+			answer, _ := RunAgent(ctx, client, sess.Messages, model, temp, stepCh)
+			answerCh <- answer
+		}()
+
+		// Стримим шаги
+		for step := range stepCh {
+			writeStep(step)
+		}
+
+		// Сохраняем финальный ответ
+		if answer := <-answerCh; answer != "" {
+			_ = store.AppendAndSave(sess, Message{Role: "assistant", Content: answer})
+		}
+
+		data, _ := json.Marshal(map[string]bool{"done": true})
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	})
+
+	// ── RAG: загрузка документа ──────────────────────────────────────────
+	// POST /api/upload  (multipart/form-data, поле "file")
+	mux.HandleFunc("/api/upload", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+		if err := r.ParseMultipartForm(maxUploadSize); err != nil {
+			http.Error(w, "файл слишком большой (макс 10MB)", 413)
+			return
+		}
+
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "поле 'file' не найдено", 400)
+			return
+		}
+		defer file.Close()
+
+		content, err := io.ReadAll(io.LimitReader(file, maxUploadSize))
+		if err != nil {
+			http.Error(w, "ошибка чтения файла", 500)
+			return
+		}
+
+		// Определяем тип и извлекаем текст
+		text := extractText(content, header.Filename)
+		if strings.TrimSpace(text) == "" {
+			http.Error(w, "файл пустой или неподдерживаемый формат", 422)
+			return
+		}
+
+		ctx := r.Context()
+		n, err := rag.AddDocument(ctx, header.Filename, text)
+		if err != nil {
+			http.Error(w, "ошибка индексации: "+err.Error(), 500)
+			return
+		}
+
+		jsonOK(w, map[string]any{
+			"name":   header.Filename,
+			"chunks": n,
+			"size":   len(content),
+		})
+	})
+
+	// ── RAG: список и удаление документов ───────────────────────────────
+	mux.HandleFunc("/api/docs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			docs := rag.ListDocs()
+			if docs == nil {
+				docs = []DocMeta{}
+			}
+			jsonOK(w, docs)
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	})
+
+	mux.HandleFunc("/api/docs/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/docs/"), "/")
+		if id == "" {
+			http.Error(w, "missing doc id", 400)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if err := rag.DeleteDoc(id); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		jsonOK(w, map[string]bool{"ok": true})
+	})
+
+	// ── Очистить историю ─────────────────────────────────────────────────
 	mux.HandleFunc("/api/clear", func(w http.ResponseWriter, r *http.Request) {
 		sid := r.URL.Query().Get("session")
 		if sid == "" {
@@ -264,10 +412,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		}
 		sess, _ := store.Load(sid)
 		if sess != nil {
-			prompt := sess.Settings.SystemPrompt
-			if prompt == "" {
-				prompt = systemPrompt
-			}
+			prompt := firstNonEmpty(sess.Settings.SystemPrompt, systemPrompt)
 			sess.Messages = []Message{{Role: "system", Content: prompt}}
 			sess.Title = "Новый чат"
 			_ = store.Save(sess)
@@ -275,31 +420,33 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		jsonOK(w, map[string]bool{"ok": true})
 	})
 
-	// ── Health-check ───────────────────────────────────────────────────────
+	// ── Health ───────────────────────────────────────────────────────────
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ok := client.IsAvailable()
 		if !ok {
-			w.WriteHeader(http.StatusServiceUnavailable)
+			w.WriteHeader(503)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"ollama":%v}`, ok)
+		docCount := len(rag.ListDocs())
+		fmt.Fprintf(w, `{"ollama":%v,"docs":%d}`, ok, docCount)
 	})
 
-	// OpenAI-совместимый API (/v1/models, /v1/chat/completions)
 	registerOpenAIRoutes(mux, client, defaultModel)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v1.2 запущен%s\n", colorGreen, colorReset)
-	fmt.Printf("    Веб:   %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
-	fmt.Printf("    Данные: %s%s%s\n", colorGray, dataDir, colorReset)
-	fmt.Printf("    Модель: %s%s%s\n\n", colorYellow, defaultModel, colorReset)
+	fmt.Printf("%s[✓] LocalAI v2.0 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
+	fmt.Printf("    Агент:  POST /api/agent\n")
+	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
+	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
+	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)
 
 	if err := http.ListenAndServe(addr, withLogging(mux)); err != nil {
-		log.Fatalf("Ошибка сервера: %v", err)
+		log.Fatalf("Сервер: %v", err)
 	}
 }
 
-// ── Вспомогательные функции ────────────────────────────────────────────────
+// ── Вспомогательные ─────────────────────────────────────────────────────
 
 func jsonOK(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -308,9 +455,64 @@ func jsonOK(w http.ResponseWriter, v any) {
 
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/chat" && r.URL.Path != "/health" {
+		skip := r.URL.Path == "/api/chat" || r.URL.Path == "/api/agent" || r.URL.Path == "/health"
+		if !skip {
 			log.Printf("%s %s", r.Method, r.URL.Path)
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// extractText извлекает текст из содержимого файла.
+// Поддерживает: .txt, .md, .csv, .json, .go, .py, .js, .ts, .html, .yaml, .toml
+// PDF не поддерживается без CGO — возвращаем сообщение об ошибке.
+func extractText(data []byte, filename string) string {
+	lower := strings.ToLower(filename)
+
+	// Бинарные форматы без поддержки
+	if strings.HasSuffix(lower, ".pdf") {
+		return "[PDF файлы не поддерживаются без дополнительных библиотек. " +
+			"Пожалуйста, сконвертируй PDF в TXT или MD перед загрузкой.]"
+	}
+	if strings.HasSuffix(lower, ".docx") || strings.HasSuffix(lower, ".doc") {
+		return "[DOCX/DOC не поддерживаются. Пожалуйста, сохрани документ в TXT или MD.]"
+	}
+
+	// Всё остальное — текст
+	text := string(data)
+
+	// Базовая очистка HTML-тегов для .html файлов
+	if strings.HasSuffix(lower, ".html") || strings.HasSuffix(lower, ".htm") {
+		text = stripHTMLTags(text)
+	}
+
+	return text
+}
+
+// stripHTMLTags удаляет HTML-теги из текста.
+func stripHTMLTags(html string) string {
+	var sb strings.Builder
+	inTag := false
+	for _, r := range html {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+			sb.WriteRune(' ')
+		case !inTag:
+			sb.WriteRune(r)
+		}
+	}
+	// Схлопываем лишние пробелы
+	return strings.Join(strings.Fields(sb.String()), " ")
 }

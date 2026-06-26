@@ -149,6 +149,9 @@ details.step-card summary::-webkit-details-marker{display:none}
 #input:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(88,166,255,.12)}
 #send{padding:9px 15px;font-size:1rem}
 #upload-btn{font-size:1rem;padding:9px}
+#mic-btn{font-size:1rem;padding:9px;transition:background .15s,border-color .15s}
+#mic-btn.recording{background:var(--red);border-color:var(--red);color:#fff;animation:mic-pulse 1s steps(1) infinite}
+@keyframes mic-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 
 /* Настройки */
 #settings-panel{position:fixed;top:0;right:-340px;width:320px;height:100vh;
@@ -303,6 +306,7 @@ details.step-card summary::-webkit-details-marker{display:none}
     </div>
     <div id="input-row">
       <button class="btn icon" id="upload-btn" onclick="$('file-input').click()" title="Загрузить документ в базу знаний">📎</button>
+      <button class="btn icon" id="mic-btn" onclick="toggleMic()" title="Голосовой ввод (нажми чтобы записать)">🎤</button>
       <textarea id="input" placeholder="Введи сообщение… (Enter — отправить, Shift+Enter — новая строка)" rows="1"></textarea>
       <button class="btn prim" id="send" onclick="send()">➤</button>
     </div>
@@ -903,6 +907,130 @@ async function createUser(){
   }catch(e){setStatus('⚠ '+e.message);}
 }
 
+// ── Голосовой ввод (STT) ──────────────────────────────────────────────
+
+let mediaRecorder = null;
+let audioChunks   = [];
+let micRecording  = false;
+let micTimer      = null;
+let whisperAvail  = false;
+
+// Проверяем доступность Whisper при старте приложения
+async function checkAudioStatus(){
+  try{
+    const r = await authFetch('/api/audio/status');
+    if(!r.ok) return;
+    const d = await r.json();
+    whisperAvail = d.whisper_available;
+    if(!whisperAvail){
+      $('mic-btn').title = 'Голосовой ввод недоступен (Whisper STT не запущен)';
+      $('mic-btn').style.opacity = '0.45';
+    } else {
+      $('mic-btn').title = 'Голосовой ввод — нажми чтобы начать запись';
+      $('mic-btn').style.opacity = '';
+    }
+  }catch{}
+}
+
+// Переключатель записи: клик → начать | повторный клик → остановить
+async function toggleMic(){
+  if(!whisperAvail){
+    setStatus('⚠ Whisper STT недоступен. Запусти: docker run -p 8081:8080 onerahmet/openai-whisper-asr-webservice:latest');
+    return;
+  }
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    setStatus('⚠ Браузер не поддерживает доступ к микрофону');
+    return;
+  }
+  if(micRecording){
+    stopMic();
+  } else {
+    await startMic();
+  }
+}
+
+async function startMic(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true, video:false});
+    audioChunks = [];
+
+    // Выбираем поддерживаемый формат
+    const mime =
+      MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
+      MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')  ? 'audio/ogg;codecs=opus'  :
+      'audio/webm';
+
+    mediaRecorder = new MediaRecorder(stream, {mimeType: mime});
+    mediaRecorder.ondataavailable = e => { if(e.data && e.data.size > 0) audioChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      sendAudioToWhisper();
+    };
+
+    mediaRecorder.start(500); // чанки каждые 500 мс
+    micRecording = true;
+    const btn = $('mic-btn');
+    btn.classList.add('recording');
+    btn.textContent = '⏹';
+    btn.title = 'Остановить запись';
+    setStatus('🎤 Идёт запись… Нажми ⏹ чтобы остановить');
+
+    // Авто-стоп через 90 секунд
+    micTimer = setTimeout(stopMic, 90_000);
+  }catch(e){
+    setStatus('⚠ Микрофон: ' + e.message);
+  }
+}
+
+function stopMic(){
+  if(micTimer){ clearTimeout(micTimer); micTimer = null; }
+  if(mediaRecorder && mediaRecorder.state !== 'inactive'){
+    mediaRecorder.stop(); // onstop → sendAudioToWhisper
+  }
+  micRecording = false;
+  const btn = $('mic-btn');
+  btn.classList.remove('recording');
+  btn.textContent = '🎤';
+  btn.title = 'Голосовой ввод';
+  setStatus('⏳ Распознаю речь…');
+}
+
+async function sendAudioToWhisper(){
+  if(audioChunks.length === 0){ setStatus('⚠ Нет аудио данных'); return; }
+
+  const mimeType = audioChunks[0].type || 'audio/webm';
+  const blob = new Blob(audioChunks, {type: mimeType});
+  const ext  = mimeType.includes('ogg') ? '.ogg' : '.webm';
+
+  const fd = new FormData();
+  fd.append('file', blob, 'recording' + ext);
+  fd.append('model', 'whisper-1');
+
+  try{
+    const r = await authFetch('/api/audio/transcriptions', {method:'POST', body:fd});
+    if(!r.ok){
+      const t = await r.text();
+      setStatus('⚠ Ошибка распознавания: ' + t.slice(0, 120));
+      return;
+    }
+    const d = await r.json();
+    const text = (d.text || '').trim();
+    if(text){
+      const inp = $('input');
+      // Вставляем через пробел к уже набранному тексту
+      inp.value = inp.value ? inp.value.trimEnd() + ' ' + text : text;
+      inp.style.height = 'auto';
+      inp.style.height = Math.min(inp.scrollHeight, 130) + 'px';
+      inp.focus();
+      setStatus('✓ ' + text.slice(0, 80) + (text.length > 80 ? '…' : ''));
+    } else {
+      setStatus('⚠ Whisper: текст не распознан');
+    }
+  }catch(e){
+    setStatus('⚠ ' + e.message);
+  }
+}
+
 // ── Sidebar mobile ────────────────────────────────────────────────────
 function toggleSidebar(){$('sidebar').classList.toggle('open');}
 function closeSidebar(){$('sidebar').classList.remove('open');}
@@ -913,7 +1041,7 @@ $('input').addEventListener('input',function(){this.style.height='auto';this.sty
 
 // ── Загрузка приложения после авторизации ────────────────────────────
 async function loadApp(){
-  await Promise.all([loadModels(), loadSessions(), loadDocs()]);
+  await Promise.all([loadModels(), loadSessions(), loadDocs(), checkAudioStatus()]);
   setInterval(loadModels, 30000);
   setInterval(loadSessions, 12000);
   $('input').focus();

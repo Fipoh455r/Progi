@@ -49,8 +49,24 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	authMw  := RequireAuth(jwtSecret)
 	adminMw := RequireAdmin(jwtSecret)
 
+	// ── Голос: STT (Whisper) + TTS (piper) ──────────────────────────────
+	whisperURL := envOr("LOCALAI_WHISPER_URL", "http://localhost:8081")
+	whisperClient := NewWhisperClient(whisperURL)
+
+	piperBin      := os.Getenv("LOCALAI_PIPER_BIN")
+	piperVoicesDir := envOr("LOCALAI_PIPER_VOICES_DIR", dataDir+"/voices")
+	piperVoice    := envOr("LOCALAI_PIPER_VOICE", "en_US-lessac-medium")
+	piperTTS := NewPiperTTS(piperBin, piperVoicesDir, piperVoice)
+
 	if !client.IsAvailable() {
 		fmt.Printf("%s[!] Ollama недоступен (%s). Запусти Docker.%s\n", colorYellow, ollamaURL, colorReset)
+	}
+	if !whisperClient.IsAvailable() {
+		fmt.Printf("%s[!] Whisper STT недоступен (%s). Голосовой ввод отключён.%s\n",
+			colorYellow, whisperURL, colorReset)
+	}
+	if !piperTTS.IsAvailable() {
+		fmt.Printf("%s[!] piper-tts не найден. Голосовой вывод отключён.%s\n", colorYellow, colorReset)
 	}
 
 	if userStore.Count() == 0 {
@@ -507,14 +523,16 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	}))
 
 	registerOpenAIRoutes(mux, client, defaultModel)
+	registerAudioRoutes(mux, whisperClient, piperTTS, jwtSecret)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v2.2 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v2.3 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:  POST /api/agent\n")
 	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
 	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Auth:   POST /api/auth/login | /api/auth/setup\n")
+	fmt.Printf("    Аудио:  POST /api/audio/transcriptions | /api/audio/speech\n")
 	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)
 
 	if err := http.ListenAndServe(addr, withLogging(mux)); err != nil {

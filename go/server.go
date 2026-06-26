@@ -1,4 +1,4 @@
-// server.go — HTTP-сервер v2.0: чат + агент + RAG + сжатие контекста.
+// server.go — HTTP-сервер v2.2: чат + агент + RAG + сжатие + авторизация.
 package main
 
 import (
@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -30,13 +31,45 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		log.Fatalf("RAG: %v", err)
 	}
 
+	// ── Авторизация ──────────────────────────────────────────────────────
+	userStore, err := NewUserStore(dataDir)
+	if err != nil {
+		log.Fatalf("UserStore: %v", err)
+	}
+
+	jwtSecret, err := loadOrCreateSecret(dataDir)
+	if err != nil {
+		log.Fatalf("JWT секрет: %v", err)
+	}
+
+	// Rate limiter: 60 запросов/мин для API, строже для логина
+	apiLimiter   := NewRateLimiter(rateLimitMax, rateLimitWindow)
+	loginLimiter := NewRateLimiter(10, rateLimitWindow) // 10 попыток/мин
+
+	authMw  := RequireAuth(jwtSecret)
+	adminMw := RequireAdmin(jwtSecret)
+
 	if !client.IsAvailable() {
 		fmt.Printf("%s[!] Ollama недоступен (%s). Запусти Docker.%s\n", colorYellow, ollamaURL, colorReset)
 	}
 
+	if userStore.Count() == 0 {
+		fmt.Printf("%s[!] Нет пользователей. Открой http://localhost:%s и создай admin через /api/auth/setup%s\n",
+			colorYellow, port, colorReset)
+	}
+
 	mux := http.NewServeMux()
 
-	// ── Главная страница ─────────────────────────────────────────────────
+	// ── Вспомогательная обёртка для защищённых маршрутов ────────────────
+	// protected применяет middleware авторизации и rate limiting
+	protected := func(h http.HandlerFunc) http.Handler {
+		return apiLimiter.Middleware(authMw(h))
+	}
+	adminOnly := func(h http.HandlerFunc) http.Handler {
+		return apiLimiter.Middleware(adminMw(h))
+	}
+
+	// ── Главная страница (публичная) ─────────────────────────────────────
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -47,18 +80,32 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		w.Write(data)
 	})
 
+	// ── Авторизация (публичные маршруты) ─────────────────────────────────
+	registerAuthRoutes(mux, userStore, jwtSecret, loginLimiter)
+
+	// ── Health (публичный) ───────────────────────────────────────────────
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		ok := client.IsAvailable()
+		if !ok {
+			w.WriteHeader(503)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		docCount := len(rag.ListDocs())
+		fmt.Fprintf(w, `{"ollama":%v,"docs":%d}`, ok, docCount)
+	})
+
 	// ── Модели ──────────────────────────────────────────────────────────
-	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/models", protected(func(w http.ResponseWriter, r *http.Request) {
 		models, err := client.ListModels()
 		if err != nil {
 			http.Error(w, err.Error(), 503)
 			return
 		}
 		jsonOK(w, models)
-	})
+	}))
 
 	// ── Инструменты агента ───────────────────────────────────────────────
-	mux.HandleFunc("/api/tools", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/tools", protected(func(w http.ResponseWriter, r *http.Request) {
 		type toolInfo struct {
 			Name        string `json:"name"`
 			Description string `json:"description"`
@@ -69,10 +116,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			tools = append(tools, toolInfo{t.Name, t.Description, t.ArgsSchema})
 		}
 		jsonOK(w, tools)
-	})
+	}))
 
 	// ── Сессии ──────────────────────────────────────────────────────────
-	mux.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/sessions", protected(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", 405)
 			return
@@ -82,9 +129,9 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			list = []SessionMeta{}
 		}
 		jsonOK(w, list)
-	})
+	}))
 
-	mux.HandleFunc("/api/sessions/", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/sessions/", protected(func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/sessions/"), "/")
 		if id == "" {
 			http.Error(w, "missing id", 400)
@@ -140,11 +187,11 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
-	})
+	}))
 
 	// ── Обычный чат (SSE) ────────────────────────────────────────────────
 	// POST /api/chat  {message, model, session_id, temperature, use_rag}
-	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/chat", protected(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", 405)
 			return
@@ -200,7 +247,6 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 					// Вставляем контекст как system-сообщение перед последним user
 					injected := make([]Message, len(msgs))
 					copy(injected, msgs)
-					// Добавляем перед последним сообщением
 					last := injected[len(injected)-1]
 					injected[len(injected)-1] = Message{
 						Role:    "system",
@@ -248,12 +294,11 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			_ = store.AppendAndSave(sess, Message{Role: "assistant", Content: resp})
 		}
 		writeEv(map[string]bool{"done": true})
-	})
+	}))
 
 	// ── Агент (SSE с шагами) ─────────────────────────────────────────────
 	// POST /api/agent  {message, model, session_id, temperature}
-	// Возвращает поток AgentStep как SSE
-	mux.HandleFunc("/api/agent", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/agent", protected(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", 405)
 			return
@@ -323,11 +368,11 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		data, _ := json.Marshal(map[string]bool{"done": true})
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
-	})
+	}))
 
 	// ── RAG: загрузка документа ──────────────────────────────────────────
 	// POST /api/upload  (multipart/form-data, поле "file")
-	mux.HandleFunc("/api/upload", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/upload", protected(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", 405)
 			return
@@ -371,10 +416,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			"chunks": n,
 			"size":   len(content),
 		})
-	})
+	}))
 
 	// ── RAG: список и удаление документов ───────────────────────────────
-	mux.HandleFunc("/api/docs", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/docs", protected(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			docs := rag.ListDocs()
@@ -385,9 +430,9 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
-	})
+	}))
 
-	mux.HandleFunc("/api/docs/", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/docs/", protected(func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/docs/"), "/")
 		if id == "" {
 			http.Error(w, "missing doc id", 400)
@@ -402,10 +447,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			return
 		}
 		jsonOK(w, map[string]bool{"ok": true})
-	})
+	}))
 
 	// ── Очистить историю ─────────────────────────────────────────────────
-	mux.HandleFunc("/api/clear", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/clear", protected(func(w http.ResponseWriter, r *http.Request) {
 		sid := r.URL.Query().Get("session")
 		if sid == "" {
 			sid = "default"
@@ -418,27 +463,58 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			_ = store.Save(sess)
 		}
 		jsonOK(w, map[string]bool{"ok": true})
-	})
+	}))
 
-	// ── Health ───────────────────────────────────────────────────────────
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		ok := client.IsAvailable()
-		if !ok {
-			w.WriteHeader(503)
+	// ── Пользователи (admin only) ────────────────────────────────────────
+	mux.Handle("/api/auth/users", adminOnly(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			users, err := userStore.List()
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			jsonOK(w, users)
+		default:
+			http.Error(w, "method not allowed", 405)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		docCount := len(rag.ListDocs())
-		fmt.Fprintf(w, `{"ollama":%v,"docs":%d}`, ok, docCount)
-	})
+	}))
+
+	mux.Handle("/api/auth/users/", adminOnly(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/auth/users/"), "/")
+		if id == "" {
+			http.Error(w, "missing id", 400)
+			return
+		}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		// Нельзя удалить самого себя
+		claims := contextUser(r.Context())
+		if claims != nil {
+			self, _ := userStore.GetByUsername(claims.Sub)
+			if self != nil && self.ID == id {
+				http.Error(w, "нельзя удалить собственный аккаунт", 400)
+				return
+			}
+		}
+		if err := userStore.Delete(id); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		jsonOK(w, map[string]bool{"ok": true})
+	}))
 
 	registerOpenAIRoutes(mux, client, defaultModel)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v2.0 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v2.2 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:  POST /api/agent\n")
 	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
 	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
+	fmt.Printf("    Auth:   POST /api/auth/login | /api/auth/setup\n")
 	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)
 
 	if err := http.ListenAndServe(addr, withLogging(mux)); err != nil {
@@ -446,7 +522,167 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	}
 }
 
-// ── Вспомогательные ─────────────────────────────────────────────────────
+// registerAuthRoutes регистрирует публичные и аутентифицированные маршруты авторизации.
+func registerAuthRoutes(mux *http.ServeMux, users *UserStore, secret []byte, loginLimiter *RateLimiter) {
+	// POST /api/auth/setup — создать первого admin (только если нет пользователей)
+	mux.HandleFunc("/api/auth/setup", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if users.Count() > 0 {
+			http.Error(w, `{"error":"уже настроено"}`, http.StatusConflict)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil ||
+			strings.TrimSpace(body.Username) == "" || len(body.Password) < 6 {
+			http.Error(w, `{"error":"нужны username и password (мин 6 символов)"}`, 400)
+			return
+		}
+		u, err := users.Create(body.Username, body.Password, RoleAdmin)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		token, err := GenerateJWT(u.Username, u.Role, secret)
+		if err != nil {
+			http.Error(w, "ошибка создания токена", 500)
+			return
+		}
+		jsonOK(w, map[string]string{
+			"token":    token,
+			"username": u.Username,
+			"role":     u.Role,
+		})
+	})
+
+	// POST /api/auth/login — вход (возвращает JWT)
+	mux.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		// Строгий rate limiting для защиты от брутфорса
+		if !loginLimiter.Allow(clientIP(r)) {
+			http.Error(w, `{"error":"слишком много попыток"}`, http.StatusTooManyRequests)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil ||
+			strings.TrimSpace(body.Username) == "" || body.Password == "" {
+			http.Error(w, `{"error":"нужны username и password"}`, 400)
+			return
+		}
+		u, err := users.GetByUsername(body.Username)
+		if err != nil || u == nil || !VerifyPassword(u.PasswordHash, body.Password) {
+			// Одинаковая ошибка чтобы не раскрывать существование пользователя
+			http.Error(w, `{"error":"неверный логин или пароль"}`, http.StatusUnauthorized)
+			return
+		}
+		token, err := GenerateJWT(u.Username, u.Role, secret)
+		if err != nil {
+			http.Error(w, "ошибка создания токена", 500)
+			return
+		}
+		jsonOK(w, map[string]string{
+			"token":    token,
+			"username": u.Username,
+			"role":     u.Role,
+		})
+	})
+
+	// POST /api/auth/register — создать пользователя (только admin, требует Bearer)
+	mux.Handle("/api/auth/register", RequireAdmin(secret)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Role     string `json:"role"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil ||
+			strings.TrimSpace(body.Username) == "" || len(body.Password) < 6 {
+			http.Error(w, `{"error":"нужны username и password (мин 6 символов)"}`, 400)
+			return
+		}
+		if body.Role != RoleAdmin && body.Role != RoleUser {
+			body.Role = RoleUser
+		}
+		u, err := users.Create(body.Username, body.Password, body.Role)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		u.PasswordHash = "" // не отдаём хэш
+		jsonOK(w, u)
+	})))
+
+	// GET /api/auth/me — текущий пользователь (требует Bearer)
+	mux.Handle("/api/auth/me", RequireAuth(secret)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		claims := contextUser(r.Context())
+		if claims == nil {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		jsonOK(w, map[string]string{
+			"username": claims.Sub,
+			"role":     claims.Role,
+		})
+	})))
+
+	// GET /api/auth/status — публичный: нужна ли настройка?
+	mux.HandleFunc("/api/auth/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		jsonOK(w, map[string]bool{"needs_setup": users.Count() == 0})
+	})
+}
+
+// loadOrCreateSecret загружает JWT-секрет из файла или создаёт новый.
+// Приоритет: переменная окружения LOCALAI_JWT_SECRET → файл jwt_secret.key → генерация.
+func loadOrCreateSecret(dataDir string) ([]byte, error) {
+	// 1. Переменная окружения
+	if env := os.Getenv("LOCALAI_JWT_SECRET"); env != "" {
+		return []byte(env), nil
+	}
+
+	// 2. Файл на диске
+	keyPath := dataDir + "/jwt_secret.key"
+	if data, err := os.ReadFile(keyPath); err == nil && len(data) >= 16 {
+		return data, nil
+	}
+
+	// 3. Генерируем и сохраняем
+	secret, err := GenerateSecret()
+	if err != nil {
+		return nil, fmt.Errorf("генерация секрета: %w", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(keyPath, secret, 0o600); err != nil {
+		return nil, fmt.Errorf("сохранение секрета: %w", err)
+	}
+	log.Printf("[auth] JWT-секрет создан: %s", keyPath)
+	return secret, nil
+}
+
+// ── Вспомогательные ─────────────────────────────────────────────────────────
 
 func jsonOK(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")

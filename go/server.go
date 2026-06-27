@@ -1,4 +1,5 @@
-// server.go — HTTP-сервер v3.1: чат + агент + RAG + сжатие + авторизация + graceful shutdown.
+// server.go — HTTP-сервер v3.4: чат + агент + RAG + сжатие + авторизация + graceful shutdown
+//             + умный контекст (SmartContext) + шаблоны промптов + статистика токенов.
 package main
 
 import (
@@ -41,6 +42,9 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 
 	// Инициализируем пул специализированных агентов
 	InitAgentPool(dataDir)
+
+	// Инициализируем счётчик статистики токенов
+	InitTokenStats(dataDir)
 
 	// Инициализируем кэш ответов LLM (если включён в конфиге)
 	if cacheEnabled {
@@ -282,6 +286,45 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 		})
 	}))
 
+	// ── Шаблоны промптов (v3.4) ─────────────────────────────────────────
+	// GET /api/templates           — список всех шаблонов (без поля prompt)
+	// GET /api/templates/{name}    — полный шаблон (name + description + prompt + tokens)
+	mux.Handle("/api/templates", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		jsonOK(w, ListTemplates())
+	}))
+
+	mux.Handle("/api/templates/", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/templates/"), "/")
+		if name == "" {
+			jsonOK(w, ListTemplates())
+			return
+		}
+		tmpl, ok := GetTemplate(name)
+		if !ok {
+			http.Error(w, `{"error":"шаблон не найден"}`, 404)
+			return
+		}
+		jsonOK(w, tmpl)
+	}))
+
+	// ── Статистика токенов (v3.4) ─────────────────────────────────────────
+	// GET /api/token-stats — сводка экономии токенов с момента запуска
+	mux.Handle("/api/token-stats", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		jsonOK(w, GetTokenStats())
+	}))
+
 	// ── Сессии ──────────────────────────────────────────────────────────
 	mux.Handle("/api/sessions", protected(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -364,18 +407,24 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 	}))
 
 	// ── Обычный чат (SSE) ────────────────────────────────────────────────
-	// POST /api/chat  {message, model, session_id, temperature, use_rag}
+	// POST /api/chat  {message, model, session_id, temperature, use_rag,
+	//                  smart_context, template}
+	//
+	// smart_context: true — применить SmartContext (фильтрация по релевантности).
+	// template:      имя шаблона из /api/templates (напр. "code", "debug").
 	mux.Handle("/api/chat", protected(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
 		var body struct {
-			Message   string  `json:"message"`
-			Model     string  `json:"model"`
-			SessionID string  `json:"session_id"`
-			Temp      float64 `json:"temperature"`
-			UseRAG    bool    `json:"use_rag"`
+			Message      string  `json:"message"`
+			Model        string  `json:"model"`
+			SessionID    string  `json:"session_id"`
+			Temp         float64 `json:"temperature"`
+			UseRAG       bool    `json:"use_rag"`
+			SmartContext bool    `json:"smart_context"`  // v3.4: фильтрация контекста
+			Template     string  `json:"template"`       // v3.4: имя шаблона промпта
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Message) == "" {
 			http.Error(w, "bad request", 400)
@@ -400,19 +449,45 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 			temp = 0.7
 		}
 
+		// v3.4: подставляем системный промпт шаблона (если указан и отличается).
+		// Меняем только промпт для этого запроса — не сохраняем в сессии постоянно,
+		// чтобы не перетирать пользовательский system prompt.
+		if body.Template != "" {
+			if tmpl, ok := GetTemplate(body.Template); ok {
+				defaultTokens := estimateTemplateTokens(systemPrompt)
+				saved := defaultTokens - tmpl.Tokens
+				RecordTemplateUsage(saved)
+				// Применяем шаблон только если у сессии нет кастомного system prompt
+				if sess.Settings.SystemPrompt == "" {
+					sess.Messages = ApplyTemplate(sess.Messages, body.Template)
+				}
+			}
+		}
+
 		// Сохраняем сообщение пользователя
 		_ = store.AppendAndSave(sess, Message{Role: "user", Content: body.Message})
 
 		// Сжимаем историю если слишком длинная (экономия токенов)
 		ctx := r.Context()
+		tokensBefore := EstimateTokens(sess.Messages)
 		compressed, wasCompressed, _ := CompressHistory(ctx, client, sess.Messages, model)
 		if wasCompressed {
+			RecordCompression(tokensBefore, EstimateTokens(compressed))
 			sess.Messages = compressed
 			_ = store.Save(sess)
 		}
 
 		// RAG: инжектируем контекст из документов
 		msgs := sess.Messages
+
+		// v3.4: SmartContext — фильтруем нерелевантные сообщения из истории.
+		// Применяем перед RAG-инжекцией, чтобы не раздувать контекст.
+		if body.SmartContext && len(msgs) > 4 {
+			const smartBudget = 3000 // токенов; агентский бюджет из compress.go
+			filtered, origTok, filteredTok := SmartContext(msgs, body.Message, smartBudget, defaultTopN)
+			RecordContextFilter(origTok, filteredTok)
+			msgs = filtered
+		}
 		if body.UseRAG || len(rag.ListDocs()) > 0 {
 			results, err := rag.Search(ctx, body.Message, 4)
 			if err == nil && len(results) > 0 {
@@ -720,13 +795,15 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 	registerAudioRoutes(mux, whisperClient, piperTTS, jwtSecret)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.3 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.4 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:        %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:      POST /api/agent\n")
 	fmt.Printf("    Мульти:     POST /api/multiagent  (%d ролей)\n", len(AllRoles()))
 	fmt.Printf("    Агенты:     GET  /api/agents\n")
 	fmt.Printf("    Кэш:        GET  /api/cache/stats\n")
 	fmt.Printf("    RAG:        POST /api/upload | GET /api/docs\n")
+	fmt.Printf("    Шаблоны:    GET  /api/templates  (%d шаблонов)\n", len(builtinTemplates))
+	fmt.Printf("    Токены:     GET  /api/token-stats\n")
 	fmt.Printf("    OpenAI:     %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Auth:       POST /api/auth/login | /api/auth/setup\n")
 	fmt.Printf("    Аудио:      POST /api/audio/transcriptions | /api/audio/speech\n")

@@ -54,6 +54,24 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 		}
 	}
 
+	// v3.6: Семантический кэш (LOCALAI_SEMANTIC_CACHE=true включает)
+	scEnabled := os.Getenv("LOCALAI_SEMANTIC_CACHE") == "true"
+	if scEnabled {
+		scThreshold := scParseThreshold(os.Getenv("LOCALAI_SEMANTIC_THRESHOLD"), scDefaultThreshold)
+		scMaxSize := scParseMaxSize(os.Getenv("LOCALAI_SEMANTIC_CACHE_SIZE"), scDefaultMaxSize)
+		if err := InitSemanticCache(dataDir, client, "nomic-embed-text", scThreshold, scMaxSize); err != nil {
+			log.Printf("[!] Семантический кэш недоступен: %v", err)
+		} else {
+			log.Printf("[✓] Семантический кэш: threshold=%.2f, max=%d", scThreshold, scMaxSize)
+		}
+	}
+
+	// v3.6: Очередь фоновых задач (всегда активна)
+	jqWorkers := scParseMaxSize(os.Getenv("LOCALAI_JOB_WORKERS"), jqDefaultWorkers)
+	if err := InitJobQueue(dataDir, client, defaultModel, jqWorkers); err != nil {
+		log.Printf("[!] Очередь задач недоступна: %v", err)
+	}
+
 	// Предоставляем клиент инструментам требующим LLM (agent_call)
 	SetToolsClient(client, defaultModel)
 
@@ -383,6 +401,97 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 		jsonOK(w, GetTokenStats())
 	}))
 
+	// ── Семантический кэш (v3.6) ────────────────────────────────────────
+	// GET    /api/semantic-cache/stats  — статистика
+	// DELETE /api/semantic-cache        — очистить кэш
+	mux.Handle("/api/semantic-cache/stats", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if globalSemanticCache == nil {
+			jsonOK(w, SemanticCacheDisabledStats())
+			return
+		}
+		jsonOK(w, globalSemanticCache.Stats())
+	}))
+
+	mux.Handle("/api/semantic-cache", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if globalSemanticCache == nil {
+			jsonOK(w, map[string]bool{"ok": true, "was_enabled": false})
+			return
+		}
+		globalSemanticCache.Clear()
+		jsonOK(w, map[string]bool{"ok": true})
+	}))
+
+	// ── Очередь фоновых задач (v3.6) ─────────────────────────────────────
+	// POST   /api/jobs              — отправить задачу {"kind":"swarm"|"multiagent","payload":{...}}
+	// GET    /api/jobs              — список задач
+	// GET    /api/jobs/{id}         — статус и результат задачи
+	// DELETE /api/jobs/{id}         — удалить задачу
+	mux.Handle("/api/jobs", protected(func(w http.ResponseWriter, r *http.Request) {
+		if globalJobQueue == nil {
+			http.Error(w, "очередь задач не инициализирована", 503)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			jsonOK(w, globalJobQueue.List())
+		case http.MethodPost:
+			var body struct {
+				Kind    string          `json:"kind"`
+				Payload json.RawMessage `json:"payload"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Kind == "" {
+				http.Error(w, `{"error":"нужны поля kind и payload"}`, 400)
+				return
+			}
+			job, err := globalJobQueue.Submit(body.Kind, body.Payload)
+			if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			jsonOK(w, job)
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	}))
+
+	mux.Handle("/api/jobs/", protected(func(w http.ResponseWriter, r *http.Request) {
+		if globalJobQueue == nil {
+			http.Error(w, "очередь задач не инициализирована", 503)
+			return
+		}
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/jobs/"), "/")
+		if id == "" {
+			http.Error(w, "missing job id", 400)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			job, ok := globalJobQueue.Get(id)
+			if !ok {
+				http.Error(w, `{"error":"задача не найдена"}`, 404)
+				return
+			}
+			jsonOK(w, job)
+		case http.MethodDelete:
+			if err := globalJobQueue.Delete(id); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			jsonOK(w, map[string]bool{"ok": true})
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	}))
+
 	// ── Сессии ──────────────────────────────────────────────────────────
 	mux.Handle("/api/sessions", protected(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -584,6 +693,20 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 		defer metrics.ActiveDone()
 		t0 := time.Now()
 
+		// v3.6: Семантический кэш — проверяем до вызова LLM.
+		// При попадании стримим кэшированный ответ как токены (без LLM-вызова).
+		if globalSemanticCache != nil {
+			if cached, hit, _ := globalSemanticCache.Lookup(ctx, body.Message); hit {
+				// Стримим кэшированный ответ по словам (имитируем streaming)
+				for _, word := range strings.Fields(cached) {
+					writeEv(map[string]string{"token": word + " "})
+				}
+				_ = store.AppendAndSave(sess, Message{Role: "assistant", Content: cached})
+				writeEv(map[string]any{"done": true, "cached": true})
+				return
+			}
+		}
+
 		// Балансировщик: выбираем здоровую ноду для этого запроса
 		chatClient := balancer.Pick()
 		tokenCh, errCh := chatClient.ChatStreamWithTemp(ctx, msgs, model, temp)
@@ -613,6 +736,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 			// Примерно считаем токены: 1 токен ≈ 4 символа
 			metrics.Tokens.Add(int64(len([]rune(resp)) / 4))
 			_ = store.AppendAndSave(sess, Message{Role: "assistant", Content: resp})
+			// v3.6: асинхронно сохраняем в семантический кэш
+			if globalSemanticCache != nil {
+				globalSemanticCache.StoreAsync(body.Message, resp)
+			}
 		}
 		writeEv(map[string]bool{"done": true})
 	}))
@@ -853,7 +980,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 	registerAudioRoutes(mux, whisperClient, piperTTS, jwtSecret)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.5 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.6 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:        %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:      POST /api/agent\n")
 	fmt.Printf("    Рой:        POST /api/swarm       (до %d агентов)\n", swarmMaxAgents)
@@ -863,6 +990,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 	fmt.Printf("    RAG:        POST /api/upload | GET /api/docs\n")
 	fmt.Printf("    Шаблоны:    GET  /api/templates  (%d шаблонов)\n", len(builtinTemplates))
 	fmt.Printf("    Токены:     GET  /api/token-stats\n")
+	if scEnabled {
+		fmt.Printf("    СемКэш:     GET  /api/semantic-cache/stats\n")
+	}
+	fmt.Printf("    Задачи:     POST /api/jobs | GET /api/jobs/{id}\n")
 	fmt.Printf("    OpenAI:     %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Auth:       POST /api/auth/login | /api/auth/setup\n")
 	fmt.Printf("    Аудио:      POST /api/audio/transcriptions | /api/audio/speech\n")

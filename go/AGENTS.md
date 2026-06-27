@@ -8,7 +8,7 @@
 ## ФАЙЛОВАЯ КАРТА
 
 ```
-main.go            CLI точка входа. AppVersion="3.5.0". Команды: chat|serve|models|pull|config
+main.go            CLI точка входа. AppVersion="3.6.0". Команды: chat|serve|models|pull|config
                    Приоритет конфига: -flag > ENV > localai.yaml > DefaultConfig()
                    Флаги: -config -ollama -model -port -data -log
 config.go          AppConfig{OllamaURL,Model,Port,DataDir,...,LogFile,CacheEnabled,CacheTTLHours}
@@ -60,6 +60,22 @@ agent.go           RunAgent(ctx,client,msgs,model,temp,stepCh) → (string,error
 rag.go             RAG.AddDocument(ctx,name,text) → (chunks,err)   [batch parallel ×4]
                    RAG.Search(ctx,query,topK) → []SearchResult   порог=0.3
                    BuildContextString(results) → string
+ollama.go          OllamaClient.EmbedText(ctx,model,text) → ([]float64,error)  [/api/embeddings]
+semantic_cache.go  SemanticCache{threshold=0.92, maxSize=500, embedMod}
+                   InitSemanticCache(dataDir,client,embedMod,threshold,maxSize) → error
+                   Lookup(ctx,query) → (response,hit,error)   — cosine sim с коллекцией
+                   StoreAsync(query,response)  — async: embed+append+LRU eviction
+                   Stats() → SemanticCacheStats{hits,misses,hit_rate,entries,...}
+                   Clear()   TopEntries(n) → []scEntryPreview
+                   Env: LOCALAI_SEMANTIC_CACHE=true / LOCALAI_SEMANTIC_THRESHOLD / LOCALAI_SEMANTIC_CACHE_SIZE
+jobqueue.go        JobQueue — очередь фоновых задач (swarm|multiagent)
+                   InitJobQueue(dataDir,client,defaultModel,workers) → error
+                   Submit(kind,payload) → (*Job,error)   Get(id) → (*Job,bool)
+                   List() → []jobSummary   Delete(id) → error
+                   Job{ID,Kind,Status,Payload,Result,Error,Progress,CreatedAt,...}
+                   Статусы: pending→running→done|failed
+                   Воркеров: LOCALAI_JOB_WORKERS (по умолч. 4)
+                   Персистентность: data/jobs/{id}.json   TTL: 24h автоочистка
 swarm.go           RunSwarm(ctx,client,job,progressCh) → (SwarmResult,error)  — рой 100 агентов
                    SwarmJob{Text,Question,Model,MaxAgents}   SwarmResult{Answer,ChunkCount,...}
                    SwarmEvent{Kind,Index,Total,Pass,Remaining,Message,Elapsed,Result}
@@ -69,7 +85,7 @@ swarm.go           RunSwarm(ctx,client,job,progressCh) → (SwarmResult,error)  
                    swarmPyramidalMerge — O(log₂ N) проходов, swarmMergeConcurrency=12 параллельно
                    Промпты: swarmAnalystPrompt(~25 tok) / swarmMergePrompt(~20) / swarmFinalPrompt(~30)
                    Экономия: 100M токенов задача → ~50K через relevance filter + compact prompts
-server.go          runServer(url,model,port,dataDir,cacheEnabled,cacheTTLHours)  v3.5
+server.go          runServer(url,model,port,dataDir,cacheEnabled,cacheTTLHours)  v3.6
                    HTTP сервер с graceful shutdown (SIGTERM/SIGINT → 10s drain)
                    extractText: .pdf(pdftotext) .docx(stdlib ZIP+XML) .doc(antiword) .html(strip)
                    /api/chat: +smart_context(bool) +template(string) → SmartContext/ApplyTemplate
@@ -80,6 +96,8 @@ server.go          runServer(url,model,port,dataDir,cacheEnabled,cacheTTLHours) 
                    /api/cache/stats: статистика кэша (hits/misses/entries/hit_rate)
                    /api/templates: GET список / GET /{name} полный шаблон
                    /api/token-stats: сводка экономии токенов (compression/context/templates)
+                   /api/semantic-cache/stats: статистика семантического кэша
+                   /api/jobs: очередь задач (POST submit / GET list / GET|DELETE /{id})
 openai.go          registerOpenAIRoutes → GET /v1/models  POST /v1/chat/completions
 auth.go            UserStore(JSON)  HashPassword(PBKDF2-HMAC-SHA256-100k)
                    GenerateJWT / ValidateJWT (HS256, 24h)

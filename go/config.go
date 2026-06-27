@@ -40,6 +40,10 @@ type AppConfig struct {
 
 	// Логирование
 	LogFile string `yaml:"log_file"` // путь к лог-файлу; пустая = только stderr
+
+	// Кэш LLM-ответов
+	CacheEnabled bool `yaml:"cache_enabled"` // включить кэш (по умолч. true)
+	CacheTTLHours int  `yaml:"cache_ttl_hours"` // TTL в часах (0 = не истекает)
 }
 
 // DefaultConfig возвращает конфигурацию с умолчаниями.
@@ -56,6 +60,8 @@ func DefaultConfig() AppConfig {
 		OllamaNodes:    "",
 		MetricsEnabled: true,
 		JWTSecret:      "",
+		CacheEnabled:   true,
+		CacheTTLHours:  1,
 	}
 }
 
@@ -114,6 +120,14 @@ func LoadConfig(path string) (AppConfig, error) {
 	if v, ok := kv["log_file"]; ok {
 		cfg.LogFile = v
 	}
+	if v, ok := kv["cache_enabled"]; ok {
+		cfg.CacheEnabled = parseBool(v, true)
+	}
+	if v, ok := kv["cache_ttl_hours"]; ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			cfg.CacheTTLHours = n
+		}
+	}
 
 	return cfg, nil
 }
@@ -156,6 +170,14 @@ func (c *AppConfig) MergeEnv() {
 	if v := os.Getenv("LOCALAI_LOG_FILE"); v != "" {
 		c.LogFile = v
 	}
+	if v := os.Getenv("LOCALAI_CACHE_ENABLED"); v != "" {
+		c.CacheEnabled = parseBool(v, c.CacheEnabled)
+	}
+	if v := os.Getenv("LOCALAI_CACHE_TTL_HOURS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			c.CacheTTLHours = n
+		}
+	}
 }
 
 // WriteExample создаёт пример config-файла по указанному пути.
@@ -187,6 +209,10 @@ jwt_secret: ""
 
 # Лог-файл: путь к файлу; пусто = только stderr; ротация при >10MB
 # log_file: /var/log/localai/app.log
+
+# Кэш ответов LLM: ускоряет повторные запросы, экономит токены
+cache_enabled: true
+cache_ttl_hours: 1
 `
 	return os.WriteFile(path, []byte(template), 0o644)
 }

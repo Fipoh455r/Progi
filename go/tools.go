@@ -12,6 +12,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +36,21 @@ var memoryDataDir string
 // Должна вызываться до первого использования инструмента memory.
 func SetMemoryDir(dataDir string) {
 	memoryDataDir = filepath.Join(dataDir, "memory")
+}
+
+// ── Глобальный контекст для инструмента agent_call ────────────────────────
+
+// toolsClient / toolsModel хранят клиент LLM для инструмента agent_call.
+// Устанавливаются из runServer через SetToolsClient.
+var (
+	toolsClient *OllamaClient
+	toolsModel  string
+)
+
+// SetToolsClient инициализирует клиент для инструментов требующих LLM.
+func SetToolsClient(client *OllamaClient, model string) {
+	toolsClient = client
+	toolsModel = model
 }
 
 // ToolDef описывает один инструмент.
@@ -701,6 +717,51 @@ func formatFacts(facts map[string]string) string {
 		sb.WriteString(fmt.Sprintf("• %s: %s\n", k, v))
 	}
 	return strings.TrimRight(sb.String(), "\n")
+}
+
+// init регистрирует agent_call отдельно от AllTools-литерала чтобы избежать
+// цикла инициализации: AllTools → toolAgentCall → RunRoleAgent → ... → AllTools.
+func init() {
+	AllTools["agent_call"] = &ToolDef{
+		Name:        "agent_call",
+		Description: "Делегировать подзадачу специалисту. Роли: coder,debugger,reviewer,planner,researcher,writer,summarizer,critic,translator,analyst,math,security",
+		ArgsSchema:  `{"role": "имя_роли", "task": "конкретная подзадача для специалиста"}`,
+		Run:         toolAgentCall,
+	}
+}
+
+// ── agent_call ─────────────────────────────────────────────────────────────
+
+// toolAgentCall делегирует подзадачу специализированному агенту.
+// Использует глобальный toolsClient, установленный через SetToolsClient.
+func toolAgentCall(args map[string]any) (string, error) {
+	role, _ := args["role"].(string)
+	task, _ := args["task"].(string)
+
+	if role == "" {
+		return "", fmt.Errorf("нужен аргумент 'role': coder|debugger|reviewer|planner|researcher|writer|summarizer|critic|translator|analyst|math|security")
+	}
+	if task == "" {
+		return "", fmt.Errorf("нужен аргумент 'task'")
+	}
+	if toolsClient == nil {
+		return "", fmt.Errorf("agent_call недоступен: сервер не инициализирован")
+	}
+
+	// Проверяем что роль существует
+	if _, ok := GetRole(role); !ok {
+		return "", fmt.Errorf("неизвестная роль %q; список ролей: GET /api/agents", role)
+	}
+
+	// Выполняем через пул (без SSE-канала — синхронный вызов)
+	ctx := context.Background()
+	resp, err := RunRoleAgent(ctx, toolsClient, role, task, toolsModel, nil)
+	if err != nil {
+		return "", fmt.Errorf("агент %s: %w", role, err)
+	}
+
+	// Компактный заголовок чтобы агент знал кто ответил
+	return fmt.Sprintf("[%s]\n%s", role, resp), nil
 }
 
 // RunTool выполняет инструмент по имени с заданными аргументами.

@@ -25,7 +25,8 @@ var staticFiles embed.FS
 const maxUploadSize = 10 << 20 // 10 MB
 
 // runServer запускает HTTP-сервер.
-func runServer(ollamaURL, defaultModel, port, dataDir string) {
+// cacheEnabled/cacheTTLHours управляют кэшем LLM-ответов.
+func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool, cacheTTLHours int) {
 	// ── Балансировщик нод Ollama ─────────────────────────────────────────
 	balancer := NewOllamaBalancer(ollamaURL)
 	client := balancer.Primary() // для RAG, compress и прочих одиночных вызовов
@@ -37,6 +38,20 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 
 	// Инициализируем директорию памяти для инструмента memory
 	SetMemoryDir(dataDir)
+
+	// Инициализируем пул специализированных агентов
+	InitAgentPool(dataDir)
+
+	// Инициализируем кэш ответов LLM (если включён в конфиге)
+	if cacheEnabled {
+		ttl := time.Duration(cacheTTLHours) * time.Hour
+		if err := InitCache(dataDir, ttl); err != nil {
+			log.Printf("[!] Кэш LLM недоступен: %v", err)
+		}
+	}
+
+	// Предоставляем клиент инструментам требующим LLM (agent_call)
+	SetToolsClient(client, defaultModel)
 
 	rag, err := NewRAG(dataDir+"/rag", client, "nomic-embed-text")
 	if err != nil {
@@ -151,6 +166,120 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			tools = append(tools, toolInfo{t.Name, t.Description, t.ArgsSchema})
 		}
 		jsonOK(w, tools)
+	}))
+
+	// ── Список специализированных агентов ────────────────────────────────
+	// GET /api/agents[?tag=code] — все роли или по тегу
+	mux.Handle("/api/agents", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		tag := r.URL.Query().Get("tag")
+		type roleInfo struct {
+			Name        string   `json:"name"`
+			Description string   `json:"description"`
+			Temperature float64  `json:"temperature"`
+			MaxSteps    int      `json:"max_steps"`
+			UseTools    bool     `json:"use_tools"`
+			Tags        []string `json:"tags"`
+		}
+		var list []roleInfo
+		for _, ro := range AllRoles() {
+			if tag != "" {
+				found := false
+				for _, t := range ro.Tags {
+					if t == tag {
+						found = true
+						break
+					}
+				}
+				if !found {
+					continue
+				}
+			}
+			list = append(list, roleInfo{ro.Name, ro.Description, ro.Temperature, ro.MaxSteps, ro.UseTools, ro.Tags})
+		}
+		if list == nil {
+			list = []roleInfo{}
+		}
+		jsonOK(w, list)
+	}))
+
+	// ── Мульти-агентная задача (SSE с прогрессом) ────────────────────────
+	// POST /api/multiagent {"task":"...", "model":"..."}
+	mux.Handle("/api/multiagent", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Task  string `json:"task"`
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Task) == "" {
+			http.Error(w, "нужен непустой task", 400)
+			return
+		}
+		model := firstNonEmpty(body.Model, defaultModel)
+
+		// SSE-заголовки
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher := w.(http.Flusher)
+
+		writeEv := func(v any) {
+			data, _ := json.Marshal(v)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+
+		ctx := r.Context()
+		progressCh := make(chan OrchestratorEvent, 32)
+
+		metrics.AgentReqs.Inc()
+		metrics.ActiveStart()
+		defer metrics.ActiveDone()
+
+		resultCh := make(chan string, 1)
+		go func() {
+			answer, _ := OrchestrateTask(ctx, balancer.Pick(), body.Task, model, progressCh)
+			resultCh <- answer
+		}()
+
+		for ev := range progressCh {
+			writeEv(ev)
+		}
+
+		writeEv(map[string]bool{"done": true})
+	}))
+
+	// ── Статистика кэша ──────────────────────────────────────────────────
+	// GET /api/cache/stats
+	mux.Handle("/api/cache/stats", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if globalCache == nil {
+			jsonOK(w, map[string]any{"enabled": false})
+			return
+		}
+		hits, misses, entries := globalCache.Stats()
+		total := hits + misses
+		hitRate := 0.0
+		if total > 0 {
+			hitRate = float64(hits) / float64(total) * 100
+		}
+		jsonOK(w, map[string]any{
+			"enabled":  true,
+			"hits":     hits,
+			"misses":   misses,
+			"entries":  entries,
+			"hit_rate": fmt.Sprintf("%.1f%%", hitRate),
+		})
 	}))
 
 	// ── Сессии ──────────────────────────────────────────────────────────
@@ -591,16 +720,19 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerAudioRoutes(mux, whisperClient, piperTTS, jwtSecret)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.1 запущен%s\n", colorGreen, colorReset)
-	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
-	fmt.Printf("    Агент:  POST /api/agent\n")
-	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
-	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
-	fmt.Printf("    Auth:   POST /api/auth/login | /api/auth/setup\n")
-	fmt.Printf("    Аудио:  POST /api/audio/transcriptions | /api/audio/speech\n")
-	fmt.Printf("    Метрики: GET /metrics  (Prometheus)\n")
-	fmt.Printf("    Ноды:   %d/%d Ollama нод доступны\n", balancer.HealthyCount(), balancer.TotalCount())
-	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.3 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("    Веб:        %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
+	fmt.Printf("    Агент:      POST /api/agent\n")
+	fmt.Printf("    Мульти:     POST /api/multiagent  (%d ролей)\n", len(AllRoles()))
+	fmt.Printf("    Агенты:     GET  /api/agents\n")
+	fmt.Printf("    Кэш:        GET  /api/cache/stats\n")
+	fmt.Printf("    RAG:        POST /api/upload | GET /api/docs\n")
+	fmt.Printf("    OpenAI:     %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
+	fmt.Printf("    Auth:       POST /api/auth/login | /api/auth/setup\n")
+	fmt.Printf("    Аудио:      POST /api/audio/transcriptions | /api/audio/speech\n")
+	fmt.Printf("    Метрики:    GET  /metrics  (Prometheus)\n")
+	fmt.Printf("    Ноды:       %d/%d Ollama нод доступны\n", balancer.HealthyCount(), balancer.TotalCount())
+	fmt.Printf("    Данные:     %s%s%s\n\n", colorGray, dataDir, colorReset)
 
 	// ── Graceful shutdown: ждём SIGINT / SIGTERM ─────────────────────────
 	srv := &http.Server{

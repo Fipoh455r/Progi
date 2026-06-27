@@ -113,7 +113,7 @@ func main() {
 		runChat(cfg.OllamaURL, cfg.Model)
 
 	case "serve", "server", "web":
-		runServer(cfg.OllamaURL, cfg.Model, cfg.Port, cfg.DataDir)
+		runServer(cfg.OllamaURL, cfg.Model, cfg.Port, cfg.DataDir, cfg.CacheEnabled, cfg.CacheTTLHours)
 
 	case "models":
 		runListModels(cfg.OllamaURL)

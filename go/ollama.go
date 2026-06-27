@@ -204,6 +204,48 @@ func (c *OllamaClient) chatStreamImpl(ctx context.Context, messages []Message, m
 	return tokenCh, errCh
 }
 
+// EmbedText вычисляет вектор эмбеддинга для текста через Ollama /api/embeddings.
+// Если model пустой — используется nomic-embed-text.
+// Используется семантическим кэшем и может использоваться другими компонентами.
+func (c *OllamaClient) EmbedText(ctx context.Context, model, text string) ([]float64, error) {
+	if model == "" {
+		model = "nomic-embed-text"
+	}
+	type embedReq struct {
+		Model  string `json:"model"`
+		Prompt string `json:"prompt"`
+	}
+	type embedResp struct {
+		Embedding []float64 `json:"embedding"`
+	}
+
+	body, err := json.Marshal(embedReq{Model: model, Prompt: text})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/api/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama embeddings недоступен: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama embeddings: статус %d", resp.StatusCode)
+	}
+	var result embedResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("ollama embeddings decode: %w", err)
+	}
+	return result.Embedding, nil
+}
+
 // ListModels возвращает список моделей, загруженных в Ollama.
 func (c *OllamaClient) ListModels() ([]ModelInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

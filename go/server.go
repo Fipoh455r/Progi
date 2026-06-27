@@ -1,4 +1,4 @@
-// server.go — HTTP-сервер v3.8: чат + агент + RAG + гибридный поиск + роутер + code interpreter.
+// server.go — HTTP-сервер v3.9: чат + агент + RAG + гибридный поиск + роутер + code interpreter + dev tools.
 package main
 
 import (
@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 //go:embed static/index.html
@@ -32,6 +33,20 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 
 	// Гибридный поисковик (BM25 + cosine); строит BM25-индекс при старте.
 	hs := NewHybridSearcher(rag)
+
+	// Фоновый cleanup: удаляем сессии старше 30 дней каждые 24 часа.
+	const sessionMaxAge = 30 * 24 * time.Hour
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			if n, err := store.CleanupOldSessions(sessionMaxAge); err != nil {
+				log.Printf("[cleanup] ошибка: %v", err)
+			} else if n > 0 {
+				log.Printf("[cleanup] удалено %d устаревших сессий (старше 30 дней)", n)
+			}
+		}
+	}()
 
 	if !client.IsAvailable() {
 		fmt.Printf("%s[!] Ollama недоступен (%s). Запусти Docker.%s\n", colorYellow, ollamaURL, colorReset)
@@ -409,6 +424,46 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		jsonOK(w, map[string]bool{"ok": true})
 	})
 
+	// ── Автоочистка старых сессий ────────────────────────────────────────
+	// POST /api/sessions/cleanup?days=30  — удалить сессии старше N дней
+	// GET  /api/sessions/cleanup          — статистика (кол-во, размер на диске)
+	mux.HandleFunc("/api/sessions/cleanup", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// Возвращаем статистику без удаления
+			totalBytes, count := store.DiskUsage()
+			jsonOK(w, map[string]any{
+				"sessions":    count,
+				"disk_bytes":  totalBytes,
+				"disk_kb":     totalBytes / 1024,
+				"cleanup_age": "30 days",
+			})
+		case http.MethodPost:
+			// Опциональный параметр days (по умолчанию 30)
+			days := 30
+			if d := r.URL.Query().Get("days"); d != "" {
+				if n, err := fmt.Sscanf(d, "%d", &days); n != 1 || err != nil || days < 1 {
+					http.Error(w, "параметр days должен быть числом ≥ 1", 400)
+					return
+				}
+			}
+			maxAge := time.Duration(days) * 24 * time.Hour
+			n, err := store.CleanupOldSessions(maxAge)
+			if err != nil {
+				http.Error(w, "ошибка очистки: "+err.Error(), 500)
+				return
+			}
+			log.Printf("[cleanup] ручной запуск: удалено %d сессий (старше %d дней)", n, days)
+			jsonOK(w, map[string]any{
+				"deleted":  n,
+				"max_age":  fmt.Sprintf("%d days", days),
+				"message":  fmt.Sprintf("Удалено %d сессий старше %d дней", n, days),
+			})
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	})
+
 	// ── Очистить историю ─────────────────────────────────────────────────
 	mux.HandleFunc("/api/clear", func(w http.ResponseWriter, r *http.Request) {
 		sid := r.URL.Query().Get("session")
@@ -457,7 +512,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerOpenAIRoutes(mux, client, defaultModel)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.8 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.9 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:  POST /api/agent  (инструменты: %d)\n", len(AllTools))
 	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs  (BM25+cosine, code-aware)\n")

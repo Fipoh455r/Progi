@@ -209,6 +209,72 @@ func (s *Storage) AppendAndSave(sess *Session, msgs ...Message) error {
 	return s.Save(sess)
 }
 
+// CleanupOldSessions удаляет сессии, которые не обновлялись дольше maxAge.
+// Возвращает количество удалённых сессий.
+// Защищённые сессии (id == "default") не удаляются.
+func (s *Storage) CleanupOldSessions(maxAge time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return 0, fmt.Errorf("CleanupOldSessions: чтение директории: %w", err)
+	}
+
+	cutoff := time.Now().Add(-maxAge)
+	deleted := 0
+
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+
+		p := filepath.Join(s.dir, e.Name())
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+
+		var sess Session
+		if err := json.Unmarshal(data, &sess); err != nil {
+			continue
+		}
+
+		// Не трогаем дефолтную сессию и совсем свежие
+		if sess.ID == "default" {
+			continue
+		}
+
+		if sess.UpdatedAt.Before(cutoff) {
+			if err := os.Remove(p); err == nil {
+				deleted++
+			}
+		}
+	}
+	return deleted, nil
+}
+
+// DiskUsage возвращает суммарный размер всех файлов сессий в байтах и их количество.
+func (s *Storage) DiskUsage() (totalBytes int64, count int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			totalBytes += info.Size()
+			count++
+		}
+	}
+	return totalBytes, count
+}
+
 // truncate обрезает строку до maxLen рун, добавляя "…" если обрезана.
 func truncate(s string, maxLen int) string {
 	runes := []rune(s)

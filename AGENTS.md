@@ -11,7 +11,9 @@ Progi/
 │   ├── hybrid_search.go # Гибридный поиск: BM25 + cosine similarity
 │   ├── router.go        # Model Router: классификатор задач (без LLM)
 │   ├── agent.go         # Агент с инструментами (ReAct-цикл)
-│   ├── tools.go         # Инструменты агента
+│   ├── tools.go         # Инструменты агента (calculator, datetime, web_search, read/write_file, http_get)
+│   ├── tools_code.go    # Инструменты кода (run_code, shell, list_dir, grep_file, detect_lang)
+│   ├── tools_dev.go     # Dev-инструменты (git, http_request, json_query, diff, regex, encode)
 │   ├── chat.go          # Интерактивный чат в терминале
 │   ├── compress.go      # Сжатие истории (экономия токенов)
 │   ├── ollama.go        # Клиент Ollama API
@@ -30,6 +32,10 @@ Progi/
 - Баннер сервера в `go/server.go`: `LocalAI vX.Y`
 - При изменении мажорных фич — обновлять обе строки
 
+## Версия
+
+Текущая: **v3.9.0**
+
 ## API эндпоинты
 
 | Метод | URL | Описание |
@@ -40,6 +46,8 @@ Progi/
 | GET  | `/api/docs`   | Список документов в RAG |
 | DELETE | `/api/docs/{id}` | Удалить документ из RAG |
 | POST | `/api/router/classify` | Классификация задачи. Тело: `{query}`. Возврат: `{task, confidence, reason}` |
+| GET  | `/api/sessions/cleanup` | Статистика сессий (кол-во, размер на диске) |
+| POST | `/api/sessions/cleanup?days=30` | Удалить сессии старше N дней |
 | GET  | `/api/models` | Список моделей Ollama |
 | GET  | `/api/sessions` | Список сессий |
 | POST `/v1/...` | | OpenAI-совместимый API |

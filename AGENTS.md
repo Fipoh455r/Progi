@@ -14,6 +14,7 @@ Progi/
 │   ├── tools.go         # Инструменты агента (calculator, datetime, web_search, read/write_file, http_get)
 │   ├── tools_code.go    # Инструменты кода (run_code, shell, list_dir, grep_file, detect_lang)
 │   ├── tools_dev.go     # Dev-инструменты (git, http_request, json_query, diff, regex, encode)
+│   ├── tools_data.go    # Data-инструменты (fetch_page, memory, sqlite)
 │   ├── chat.go          # Интерактивный чат в терминале
 │   ├── compress.go      # Сжатие истории (экономия токенов)
 │   ├── ollama.go        # Клиент Ollama API
@@ -34,7 +35,7 @@ Progi/
 
 ## Версия
 
-Текущая: **v3.9.0**
+Текущая: **v4.0.0**
 
 ## API эндпоинты
 

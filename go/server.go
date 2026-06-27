@@ -1,4 +1,4 @@
-// server.go — HTTP-сервер v3.9: чат + агент + RAG + гибридный поиск + роутер + code interpreter + dev tools.
+// server.go — HTTP-сервер v4.0: чат + агент + RAG + 20 инструментов + персистентная память.
 package main
 
 import (
@@ -30,6 +30,9 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	if err != nil {
 		log.Fatalf("RAG: %v", err)
 	}
+
+	// Инициализируем инструменты работы с данными (память агента).
+	initDataTools(dataDir)
 
 	// Гибридный поисковик (BM25 + cosine); строит BM25-индекс при старте.
 	hs := NewHybridSearcher(rag)
@@ -512,7 +515,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerOpenAIRoutes(mux, client, defaultModel)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.9 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v4.0 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:  POST /api/agent  (инструменты: %d)\n", len(AllTools))
 	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs  (BM25+cosine, code-aware)\n")

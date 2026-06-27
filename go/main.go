@@ -16,7 +16,7 @@ import (
 	"os"
 )
 
-const appVersion = "3.9.0"
+const appVersion = "4.0.0"
 
 func main() {
 	// Флаги — переопределяют переменные окружения

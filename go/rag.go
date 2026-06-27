@@ -119,7 +119,17 @@ func (r *RAG) AddDocument(ctx context.Context, name, text string) (int, error) {
 	r.removeDocByName(name)
 
 	docID := fmt.Sprintf("doc_%d", time.Now().UnixNano())
-	chunks := chunkText(text, 400, 60) // ~400 слов на чанк, 60 слов overlap
+
+	// Выбираем стратегию чанкинга: для кода — языко-осознанная, для прозы — по словам.
+	var chunks []string
+	if IsCodeFile(name) {
+		if codeChunks := ChunkCodeFile(text, name); len(codeChunks) > 0 {
+			chunks = codeChunks
+		}
+	}
+	if len(chunks) == 0 {
+		chunks = chunkText(text, 400, 60) // ~400 слов на чанк, 60 слов overlap
+	}
 
 	var newChunks []Chunk
 	for i, chunkText := range chunks {
@@ -238,6 +248,25 @@ func (r *RAG) ListDocs() []DocMeta {
 	defer r.mu.RUnlock()
 	result := make([]DocMeta, len(r.index.Docs))
 	copy(result, r.index.Docs)
+	return result
+}
+
+// ListChunks возвращает все чанки (без эмбеддингов для экономии памяти).
+// Нужно для BM25-индекса и отладки.
+func (r *RAG) ListChunks() []Chunk {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]Chunk, len(r.index.Chunks))
+	for i, c := range r.index.Chunks {
+		// Копируем без эмбеддинга — экономим выделение памяти
+		result[i] = Chunk{
+			ID:       c.ID,
+			DocID:    c.DocID,
+			DocName:  c.DocName,
+			Text:     c.Text,
+			ChunkIdx: c.ChunkIdx,
+		}
+	}
 	return result
 }
 

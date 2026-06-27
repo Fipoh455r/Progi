@@ -1,4 +1,4 @@
-// server.go — HTTP-сервер v2.2: чат + агент + RAG + сжатие + авторизация.
+// server.go — HTTP-сервер v4.0: чат + агент + RAG + 20 инструментов + авторизация + персистентная память.
 package main
 
 import (
@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 //go:embed static/index.html
@@ -30,6 +31,26 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	if err != nil {
 		log.Fatalf("RAG: %v", err)
 	}
+
+	// Инициализируем инструменты работы с данными (память агента).
+	initDataTools(dataDir)
+
+	// Гибридный поисковик (BM25 + cosine); строит BM25-индекс при старте.
+	hs := NewHybridSearcher(rag)
+
+	// Фоновый cleanup: удаляем сессии старше 30 дней каждые 24 часа.
+	const sessionMaxAge = 30 * 24 * time.Hour
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			if n, err := store.CleanupOldSessions(sessionMaxAge); err != nil {
+				log.Printf("[cleanup] ошибка: %v", err)
+			} else if n > 0 {
+				log.Printf("[cleanup] удалено %d устаревших сессий (старше 30 дней)", n)
+			}
+		}
+	}()
 
 	// ── Авторизация ──────────────────────────────────────────────────────
 	userStore, err := NewUserStore(dataDir)
@@ -237,10 +258,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			_ = store.Save(sess)
 		}
 
-		// RAG: инжектируем контекст из документов
+		// RAG: инжектируем контекст из документов (гибридный поиск BM25+cosine)
 		msgs := sess.Messages
 		if body.UseRAG || len(rag.ListDocs()) > 0 {
-			results, err := rag.Search(ctx, body.Message, 4)
+			results, err := hs.Search(ctx, body.Message, 4, -1)
 			if err == nil && len(results) > 0 {
 				ragCtx := BuildContextString(results)
 				if ragCtx != "" {
@@ -410,6 +431,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			http.Error(w, "ошибка индексации: "+err.Error(), 500)
 			return
 		}
+		hs.RebuildBM25() // обновляем BM25-индекс после нового документа
 
 		jsonOK(w, map[string]any{
 			"name":   header.Filename,
@@ -446,8 +468,49 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		hs.RebuildBM25() // обновляем BM25-индекс после удаления
 		jsonOK(w, map[string]bool{"ok": true})
 	}))
+
+	// ── Автоочистка старых сессий ────────────────────────────────────────
+	// POST /api/sessions/cleanup?days=30  — удалить сессии старше N дней
+	// GET  /api/sessions/cleanup          — статистика (кол-во, размер на диске)
+	mux.HandleFunc("/api/sessions/cleanup", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			// Возвращаем статистику без удаления
+			totalBytes, count := store.DiskUsage()
+			jsonOK(w, map[string]any{
+				"sessions":    count,
+				"disk_bytes":  totalBytes,
+				"disk_kb":     totalBytes / 1024,
+				"cleanup_age": "30 days",
+			})
+		case http.MethodPost:
+			// Опциональный параметр days (по умолчанию 30)
+			days := 30
+			if d := r.URL.Query().Get("days"); d != "" {
+				if n, err := fmt.Sscanf(d, "%d", &days); n != 1 || err != nil || days < 1 {
+					http.Error(w, "параметр days должен быть числом ≥ 1", 400)
+					return
+				}
+			}
+			maxAge := time.Duration(days) * 24 * time.Hour
+			n, err := store.CleanupOldSessions(maxAge)
+			if err != nil {
+				http.Error(w, "ошибка очистки: "+err.Error(), 500)
+				return
+			}
+			log.Printf("[cleanup] ручной запуск: удалено %d сессий (старше %d дней)", n, days)
+			jsonOK(w, map[string]any{
+				"deleted":  n,
+				"max_age":  fmt.Sprintf("%d days", days),
+				"message":  fmt.Sprintf("Удалено %d сессий старше %d дней", n, days),
+			})
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	})
 
 	// ── Очистить историю ─────────────────────────────────────────────────
 	mux.Handle("/api/clear", protected(func(w http.ResponseWriter, r *http.Request) {
@@ -464,6 +527,24 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		}
 		jsonOK(w, map[string]bool{"ok": true})
 	}))
+
+	// ── Роутер задач ─────────────────────────────────────────────────────
+	// POST /api/router/classify  {query}  → {task, confidence, reason}
+	mux.HandleFunc("/api/router/classify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Query) == "" {
+			http.Error(w, "bad request: поле query обязательно", 400)
+			return
+		}
+		result := ClassifyTask(body.Query)
+		jsonOK(w, result)
+	})
 
 	// ── Пользователи (admin only) ────────────────────────────────────────
 	mux.Handle("/api/auth/users", adminOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -509,10 +590,11 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerOpenAIRoutes(mux, client, defaultModel)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v2.2 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v4.0 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
-	fmt.Printf("    Агент:  POST /api/agent\n")
-	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
+	fmt.Printf("    Агент:  POST /api/agent  (инструменты: %d)\n", len(AllTools))
+	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs  (BM25+cosine, code-aware)\n")
+	fmt.Printf("    Роутер: POST /api/router/classify\n")
 	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Auth:   POST /api/auth/login | /api/auth/setup\n")
 	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)

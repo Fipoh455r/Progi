@@ -1,7 +1,8 @@
-// server.go — HTTP-сервер v2.2: чат + агент + RAG + сжатие + авторизация.
+// server.go — HTTP-сервер v3.1: чат + агент + RAG + сжатие + авторизация + graceful shutdown.
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -566,7 +569,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerAudioRoutes(mux, whisperClient, piperTTS, jwtSecret)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.0 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.1 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:  POST /api/agent\n")
 	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
@@ -577,9 +580,34 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	fmt.Printf("    Ноды:   %d/%d Ollama нод доступны\n", balancer.HealthyCount(), balancer.TotalCount())
 	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)
 
-	if err := http.ListenAndServe(addr, withLogging(mux)); err != nil {
-		log.Fatalf("Сервер: %v", err)
+	// ── Graceful shutdown: ждём SIGINT / SIGTERM ─────────────────────────
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      withLogging(mux),
+		ReadTimeout:  120 * time.Second, // долгие SSE-стримы
+		WriteTimeout: 0,                  // 0 = нет тайм-аута записи (нужен для SSE)
+		IdleTimeout:  60 * time.Second,
 	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Сервер: %v", err)
+		}
+	}()
+
+	<-quit
+	fmt.Printf("\n%s[→] Завершение работы...%s\n", colorYellow, colorReset)
+
+	// Даём активным соединениям 10 секунд на завершение
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("[!] Принудительное завершение: %v", err)
+	}
+	fmt.Printf("%s[✓] Сервер остановлен%s\n", colorGreen, colorReset)
 }
 
 // registerAuthRoutes регистрирует публичные и аутентифицированные маршруты авторизации.
@@ -772,15 +800,20 @@ func firstNonEmpty(vals ...string) string {
 
 // extractText извлекает текст из содержимого файла.
 // Поддерживает: .txt, .md, .csv, .json, .go, .py, .js, .ts, .html, .yaml, .toml
-// PDF не поддерживается без CGO — возвращаем сообщение об ошибке.
+// PDF: через pdftotext (poppler-utils) если установлен, иначе сообщение об ошибке.
 func extractText(data []byte, filename string) string {
 	lower := strings.ToLower(filename)
 
-	// Бинарные форматы без поддержки
+	// PDF: пробуем pdftotext
 	if strings.HasSuffix(lower, ".pdf") {
-		return "[PDF файлы не поддерживаются без дополнительных библиотек. " +
-			"Пожалуйста, сконвертируй PDF в TXT или MD перед загрузкой.]"
+		text, err := extractPDF(data)
+		if err != nil {
+			return "[PDF: " + err.Error() + ". Установи poppler-utils или сконвертируй в TXT.]"
+		}
+		return text
 	}
+
+	// DOCX/DOC не поддерживаются без внешних утилит
 	if strings.HasSuffix(lower, ".docx") || strings.HasSuffix(lower, ".doc") {
 		return "[DOCX/DOC не поддерживаются. Пожалуйста, сохрани документ в TXT или MD.]"
 	}
@@ -794,6 +827,53 @@ func extractText(data []byte, filename string) string {
 	}
 
 	return text
+}
+
+// extractPDF извлекает текст из PDF через pdftotext (poppler-utils).
+// Данные записываются во временный файл, т.к. pdftotext не умеет читать stdin.
+func extractPDF(data []byte) (string, error) {
+	// Проверяем наличие pdftotext
+	if _, err := os.Stat("/usr/bin/pdftotext"); os.IsNotExist(err) {
+		// Пробуем PATH
+		if !commandExists("pdftotext") {
+			return "", fmt.Errorf("pdftotext не найден")
+		}
+	}
+
+	// Временный файл
+	tmp, err := os.CreateTemp("", "localai-*.pdf")
+	if err != nil {
+		return "", fmt.Errorf("временный файл: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	tmp.Close()
+
+	// pdftotext -layout -enc UTF-8 input.pdf - (- означает stdout)
+	out, err := runCommand("pdftotext", "-layout", "-enc", "UTF-8", tmp.Name(), "-")
+	if err != nil {
+		return "", fmt.Errorf("pdftotext: %w", err)
+	}
+
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		return "", fmt.Errorf("PDF не содержит извлекаемого текста (возможно сканированный документ)")
+	}
+	return text, nil
+}
+
+// commandExists проверяет что команда есть в PATH.
+func commandExists(name string) bool {
+	_, err := os.Stat("/usr/local/bin/" + name)
+	if err == nil {
+		return true
+	}
+	// Поиск по PATH через exec
+	return runCommandExists(name)
 }
 
 // stripHTMLTags удаляет HTML-теги из текста.

@@ -109,7 +109,12 @@ func (r *RAG) save() error {
 
 // ── Добавление документа ──────────────────────────────────────────────────
 
-// AddDocument добавляет документ в индекс: разбивает на чанки и эмбеддирует каждый.
+// embedBatchParallel — максимальное число параллельных запросов эмбеддинга.
+// Ollama однопоточен по умолчанию, но несколько запросов ускоряют загрузку на
+// мульти-нодовых конфигурациях.
+const embedBatchParallel = 4
+
+// AddDocument добавляет документ в индекс: разбивает на чанки и эмбеддирует пакетами.
 // Возвращает количество созданных чанков.
 func (r *RAG) AddDocument(ctx context.Context, name, text string) (int, error) {
 	r.mu.Lock()
@@ -119,23 +124,12 @@ func (r *RAG) AddDocument(ctx context.Context, name, text string) (int, error) {
 	r.removeDocByName(name)
 
 	docID := fmt.Sprintf("doc_%d", time.Now().UnixNano())
-	chunks := chunkText(text, 400, 60) // ~400 слов на чанк, 60 слов overlap
+	chunkTexts := chunkText(text, 400, 60) // ~400 слов на чанк, 60 слов overlap
 
-	var newChunks []Chunk
-	for i, chunkText := range chunks {
-		// Получаем эмбеддинг у Ollama
-		emb, err := r.embed(ctx, chunkText)
-		if err != nil {
-			return 0, fmt.Errorf("эмбеддинг чанка %d: %w", i, err)
-		}
-		newChunks = append(newChunks, Chunk{
-			ID:        fmt.Sprintf("%s_c%d", docID, i),
-			DocID:     docID,
-			DocName:   name,
-			Text:      chunkText,
-			Embedding: emb,
-			ChunkIdx:  i,
-		})
+	// Параллельное эмбеддирование чанков через семафор
+	newChunks, err := r.embedChunks(ctx, docID, name, chunkTexts)
+	if err != nil {
+		return 0, err
 	}
 
 	r.index.Docs = append(r.index.Docs, DocMeta{
@@ -151,6 +145,59 @@ func (r *RAG) AddDocument(ctx context.Context, name, text string) (int, error) {
 		return len(newChunks), fmt.Errorf("сохранение индекса: %w", err)
 	}
 	return len(newChunks), nil
+}
+
+// embedChunks эмбеддирует чанки параллельно с ограничением concurrency.
+func (r *RAG) embedChunks(ctx context.Context, docID, docName string, texts []string) ([]Chunk, error) {
+	type result struct {
+		idx   int
+		chunk Chunk
+		err   error
+	}
+
+	results := make([]result, len(texts))
+	sem := make(chan struct{}, embedBatchParallel) // семафор
+	resCh := make(chan result, len(texts))
+
+	for i, txt := range texts {
+		i, txt := i, txt // захватываем переменные
+		go func() {
+			sem <- struct{}{} // захватываем слот
+			defer func() { <-sem }()
+
+			emb, err := r.embed(ctx, txt)
+			res := result{idx: i}
+			if err != nil {
+				res.err = fmt.Errorf("эмбеддинг чанка %d: %w", i, err)
+			} else {
+				res.chunk = Chunk{
+					ID:        fmt.Sprintf("%s_c%d", docID, i),
+					DocID:     docID,
+					DocName:   docName,
+					Text:      txt,
+					Embedding: emb,
+					ChunkIdx:  i,
+				}
+			}
+			resCh <- res
+		}()
+	}
+
+	// Собираем результаты в правильном порядке
+	for range texts {
+		res := <-resCh
+		results[res.idx] = res
+	}
+
+	// Проверяем ошибки и собираем финальный срез
+	chunks := make([]Chunk, 0, len(texts))
+	for _, res := range results {
+		if res.err != nil {
+			return nil, res.err
+		}
+		chunks = append(chunks, res.chunk)
+	}
+	return chunks, nil
 }
 
 // ── Поиск ─────────────────────────────────────────────────────────────────

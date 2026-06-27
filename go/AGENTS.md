@@ -8,7 +8,7 @@
 ## ФАЙЛОВАЯ КАРТА
 
 ```
-main.go            CLI точка входа. AppVersion="3.4.0". Команды: chat|serve|models|pull|config
+main.go            CLI точка входа. AppVersion="3.5.0". Команды: chat|serve|models|pull|config
                    Приоритет конфига: -flag > ENV > localai.yaml > DefaultConfig()
                    Флаги: -config -ollama -model -port -data -log
 config.go          AppConfig{OllamaURL,Model,Port,DataDir,...,LogFile,CacheEnabled,CacheTTLHours}
@@ -60,10 +60,20 @@ agent.go           RunAgent(ctx,client,msgs,model,temp,stepCh) → (string,error
 rag.go             RAG.AddDocument(ctx,name,text) → (chunks,err)   [batch parallel ×4]
                    RAG.Search(ctx,query,topK) → []SearchResult   порог=0.3
                    BuildContextString(results) → string
-server.go          runServer(url,model,port,dataDir,cacheEnabled,cacheTTLHours)  v3.4
+swarm.go           RunSwarm(ctx,client,job,progressCh) → (SwarmResult,error)  — рой 100 агентов
+                   SwarmJob{Text,Question,Model,MaxAgents}   SwarmResult{Answer,ChunkCount,...}
+                   SwarmEvent{Kind,Index,Total,Pass,Remaining,Message,Elapsed,Result}
+                   splitTextIntoChunks(text,targetWords,overlap) → []string  [overlap=25 слов]
+                   swarmSelectChunks(chunks,question,maxN) → []string  [TF keyword, из context_manager]
+                   swarmProcessChunks — параллельно: semaphore swarmMaxAgents=100 горутин
+                   swarmPyramidalMerge — O(log₂ N) проходов, swarmMergeConcurrency=12 параллельно
+                   Промпты: swarmAnalystPrompt(~25 tok) / swarmMergePrompt(~20) / swarmFinalPrompt(~30)
+                   Экономия: 100M токенов задача → ~50K через relevance filter + compact prompts
+server.go          runServer(url,model,port,dataDir,cacheEnabled,cacheTTLHours)  v3.5
                    HTTP сервер с graceful shutdown (SIGTERM/SIGINT → 10s drain)
                    extractText: .pdf(pdftotext) .docx(stdlib ZIP+XML) .doc(antiword) .html(strip)
                    /api/chat: +smart_context(bool) +template(string) → SmartContext/ApplyTemplate
+                   /api/swarm: POST SSE рой агентов (text+question → ответ через 100 агентов)
                    /api/sessions: фильтрует agent_ сессии; ?include_agent=true — показать все
                    /api/agents: список ролей агентов (?tag=code)
                    /api/multiagent: SSE OrchestrateTask (plan→parallel→merge)

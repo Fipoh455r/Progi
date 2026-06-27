@@ -286,6 +286,64 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 		})
 	}))
 
+	// ── Рой агентов (v3.5) ───────────────────────────────────────────────
+	// POST /api/swarm  {"text":"...", "question":"...", "model":"...", "max_agents":100}
+	// → SSE: SwarmEvent (kind: start|chunk|merge|done|error)
+	//
+	// Экономия токенов: задача в 100M токенов → ~50K через параллельный рой.
+	mux.Handle("/api/swarm", protected(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Text      string `json:"text"`
+			Question  string `json:"question"`
+			Model     string `json:"model"`
+			MaxAgents int    `json:"max_agents"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil ||
+			strings.TrimSpace(body.Text) == "" ||
+			strings.TrimSpace(body.Question) == "" {
+			http.Error(w, `{"error":"нужны непустые поля text и question"}`, 400)
+			return
+		}
+		model := firstNonEmpty(body.Model, defaultModel)
+
+		// SSE-заголовки
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher := w.(http.Flusher)
+
+		writeEv := func(v any) {
+			data, _ := json.Marshal(v)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+
+		ctx := r.Context()
+		progressCh := make(chan SwarmEvent, 128)
+
+		metrics.AgentReqs.Inc()
+		metrics.ActiveStart()
+		defer metrics.ActiveDone()
+
+		job := SwarmJob{
+			Text:      body.Text,
+			Question:  body.Question,
+			Model:     model,
+			MaxAgents: body.MaxAgents,
+		}
+
+		go RunSwarm(ctx, balancer.Pick(), job, progressCh)
+
+		for ev := range progressCh {
+			writeEv(ev)
+		}
+	}))
+
 	// ── Шаблоны промптов (v3.4) ─────────────────────────────────────────
 	// GET /api/templates           — список всех шаблонов (без поля prompt)
 	// GET /api/templates/{name}    — полный шаблон (name + description + prompt + tokens)
@@ -795,9 +853,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string, cacheEnabled bool,
 	registerAudioRoutes(mux, whisperClient, piperTTS, jwtSecret)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.4 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.5 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:        %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:      POST /api/agent\n")
+	fmt.Printf("    Рой:        POST /api/swarm       (до %d агентов)\n", swarmMaxAgents)
 	fmt.Printf("    Мульти:     POST /api/multiagent  (%d ролей)\n", len(AllRoles()))
 	fmt.Printf("    Агенты:     GET  /api/agents\n")
 	fmt.Printf("    Кэш:        GET  /api/cache/stats\n")

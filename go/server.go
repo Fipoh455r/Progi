@@ -1,4 +1,4 @@
-// server.go — HTTP-сервер v3.7: чат + агент + RAG + гибридный поиск + роутер задач.
+// server.go — HTTP-сервер v3.8: чат + агент + RAG + гибридный поиск + роутер + code interpreter.
 package main
 
 import (
@@ -457,10 +457,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerOpenAIRoutes(mux, client, defaultModel)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v3.7 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.8 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
-	fmt.Printf("    Агент:  POST /api/agent\n")
-	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs  (BM25+cosine)\n")
+	fmt.Printf("    Агент:  POST /api/agent  (инструменты: %d)\n", len(AllTools))
+	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs  (BM25+cosine, code-aware)\n")
 	fmt.Printf("    Роутер: POST /api/router/classify\n")
 	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)

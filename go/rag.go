@@ -119,7 +119,17 @@ func (r *RAG) AddDocument(ctx context.Context, name, text string) (int, error) {
 	r.removeDocByName(name)
 
 	docID := fmt.Sprintf("doc_%d", time.Now().UnixNano())
-	chunks := chunkText(text, 400, 60) // ~400 слов на чанк, 60 слов overlap
+
+	// Выбираем стратегию чанкинга: для кода — языко-осознанная, для прозы — по словам.
+	var chunks []string
+	if IsCodeFile(name) {
+		if codeChunks := ChunkCodeFile(text, name); len(codeChunks) > 0 {
+			chunks = codeChunks
+		}
+	}
+	if len(chunks) == 0 {
+		chunks = chunkText(text, 400, 60) // ~400 слов на чанк, 60 слов overlap
+	}
 
 	var newChunks []Chunk
 	for i, chunkText := range chunks {

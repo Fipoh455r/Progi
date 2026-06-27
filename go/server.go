@@ -1,4 +1,4 @@
-// server.go — HTTP-сервер v2.0: чат + агент + RAG + сжатие контекста.
+// server.go — HTTP-сервер v3.7: чат + агент + RAG + гибридный поиск + роутер задач.
 package main
 
 import (
@@ -29,6 +29,9 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	if err != nil {
 		log.Fatalf("RAG: %v", err)
 	}
+
+	// Гибридный поисковик (BM25 + cosine); строит BM25-индекс при старте.
+	hs := NewHybridSearcher(rag)
 
 	if !client.IsAvailable() {
 		fmt.Printf("%s[!] Ollama недоступен (%s). Запусти Docker.%s\n", colorYellow, ollamaURL, colorReset)
@@ -190,10 +193,10 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			_ = store.Save(sess)
 		}
 
-		// RAG: инжектируем контекст из документов
+		// RAG: инжектируем контекст из документов (гибридный поиск BM25+cosine)
 		msgs := sess.Messages
 		if body.UseRAG || len(rag.ListDocs()) > 0 {
-			results, err := rag.Search(ctx, body.Message, 4)
+			results, err := hs.Search(ctx, body.Message, 4, -1)
 			if err == nil && len(results) > 0 {
 				ragCtx := BuildContextString(results)
 				if ragCtx != "" {
@@ -365,6 +368,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			http.Error(w, "ошибка индексации: "+err.Error(), 500)
 			return
 		}
+		hs.RebuildBM25() // обновляем BM25-индекс после нового документа
 
 		jsonOK(w, map[string]any{
 			"name":   header.Filename,
@@ -401,6 +405,7 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		hs.RebuildBM25() // обновляем BM25-индекс после удаления
 		jsonOK(w, map[string]bool{"ok": true})
 	})
 
@@ -420,6 +425,24 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 		jsonOK(w, map[string]bool{"ok": true})
 	})
 
+	// ── Роутер задач ─────────────────────────────────────────────────────
+	// POST /api/router/classify  {query}  → {task, confidence, reason}
+	mux.HandleFunc("/api/router/classify", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Query) == "" {
+			http.Error(w, "bad request: поле query обязательно", 400)
+			return
+		}
+		result := ClassifyTask(body.Query)
+		jsonOK(w, result)
+	})
+
 	// ── Health ───────────────────────────────────────────────────────────
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		ok := client.IsAvailable()
@@ -434,10 +457,11 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	registerOpenAIRoutes(mux, client, defaultModel)
 
 	addr := ":" + port
-	fmt.Printf("%s[✓] LocalAI v2.0 запущен%s\n", colorGreen, colorReset)
+	fmt.Printf("%s[✓] LocalAI v3.7 запущен%s\n", colorGreen, colorReset)
 	fmt.Printf("    Веб:    %shttp://localhost:%s%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Агент:  POST /api/agent\n")
-	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs\n")
+	fmt.Printf("    RAG:    POST /api/upload | GET /api/docs  (BM25+cosine)\n")
+	fmt.Printf("    Роутер: POST /api/router/classify\n")
 	fmt.Printf("    OpenAI: %shttp://localhost:%s/v1%s\n", colorCyan, port, colorReset)
 	fmt.Printf("    Данные: %s%s%s\n\n", colorGray, dataDir, colorReset)
 

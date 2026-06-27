@@ -241,6 +241,25 @@ func (r *RAG) ListDocs() []DocMeta {
 	return result
 }
 
+// ListChunks возвращает все чанки (без эмбеддингов для экономии памяти).
+// Нужно для BM25-индекса и отладки.
+func (r *RAG) ListChunks() []Chunk {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]Chunk, len(r.index.Chunks))
+	for i, c := range r.index.Chunks {
+		// Копируем без эмбеддинга — экономим выделение памяти
+		result[i] = Chunk{
+			ID:       c.ID,
+			DocID:    c.DocID,
+			DocName:  c.DocName,
+			Text:     c.Text,
+			ChunkIdx: c.ChunkIdx,
+		}
+	}
+	return result
+}
+
 // DeleteDoc удаляет документ и все его чанки.
 func (r *RAG) DeleteDoc(docID string) error {
 	r.mu.Lock()

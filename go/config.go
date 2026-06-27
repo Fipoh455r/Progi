@@ -37,6 +37,9 @@ type AppConfig struct {
 
 	// Авторизация
 	JWTSecret string `yaml:"jwt_secret"` // пустая = auto-generate
+
+	// Логирование
+	LogFile string `yaml:"log_file"` // путь к лог-файлу; пустая = только stderr
 }
 
 // DefaultConfig возвращает конфигурацию с умолчаниями.
@@ -108,6 +111,9 @@ func LoadConfig(path string) (AppConfig, error) {
 	if v, ok := kv["metrics_enabled"]; ok {
 		cfg.MetricsEnabled = parseBool(v, true)
 	}
+	if v, ok := kv["log_file"]; ok {
+		cfg.LogFile = v
+	}
 
 	return cfg, nil
 }
@@ -147,6 +153,9 @@ func (c *AppConfig) MergeEnv() {
 	if v := os.Getenv("LOCALAI_METRICS_ENABLED"); v != "" {
 		c.MetricsEnabled = parseBool(v, c.MetricsEnabled)
 	}
+	if v := os.Getenv("LOCALAI_LOG_FILE"); v != "" {
+		c.LogFile = v
+	}
 }
 
 // WriteExample создаёт пример config-файла по указанному пути.
@@ -175,6 +184,9 @@ metrics_enabled: true
 
 # JWT-секрет: оставь пустым — ключ будет сгенерирован автоматически
 jwt_secret: ""
+
+# Лог-файл: путь к файлу; пусто = только stderr; ротация при >10MB
+# log_file: /var/log/localai/app.log
 `
 	return os.WriteFile(path, []byte(template), 0o644)
 }

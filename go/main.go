@@ -17,7 +17,7 @@ import (
 	"os"
 )
 
-const appVersion = "3.1.0"
+const appVersion = "3.2.0"
 
 func main() {
 	// Флаги — переопределяют и config-файл, и переменные окружения
@@ -26,6 +26,7 @@ func main() {
 	model := flag.String("model", "", "Языковая модель (переопределяет config и LOCALAI_MODEL)")
 	port := flag.String("port", "", "Порт веб-сервера (переопределяет config и LOCALAI_PORT)")
 	dataDir := flag.String("data", "", "Каталог для данных (переопределяет config и LOCALAI_DATA)")
+	logFile := flag.String("log", "", "Путь к лог-файлу (ротация при >10MB; пусто = только stderr)")
 	flag.Usage = printHelp
 	flag.Parse()
 
@@ -97,6 +98,14 @@ func main() {
 	if *dataDir != "" {
 		cfg.DataDir = *dataDir
 	}
+	if *logFile != "" {
+		cfg.LogFile = *logFile
+	}
+
+	// Инициализируем логирование в файл (если задан путь)
+	if err := InitLogger(cfg.LogFile); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Не удалось открыть лог-файл: %v\n", err)
+	}
 
 	// ── Диспетчер команд ─────────────────────────────────────────────────
 	switch cmd {
@@ -161,7 +170,8 @@ func printHelp() {
   OLLAMA_URL      URL Ollama API    (по умолч.: http://localhost:11434)
   LOCALAI_MODEL   Языковая модель   (по умолч.: qwen2.5:0.5b)
   LOCALAI_PORT    Порт веб-сервера  (по умолч.: 8080)
-  LOCALAI_DATA    Каталог данных    (по умолч.: ./data)
+  LOCALAI_DATA     Каталог данных    (по умолч.: ./data)
+  LOCALAI_LOG_FILE Путь к лог-файлу  (по умолч.: пусто — только stderr)
 
 Примеры:
   localai                              # чат в терминале

@@ -2,9 +2,12 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
@@ -31,6 +34,9 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 	if err != nil {
 		log.Fatalf("Хранилище: %v", err)
 	}
+
+	// Инициализируем директорию памяти для инструмента memory
+	SetMemoryDir(dataDir)
 
 	rag, err := NewRAG(dataDir+"/rag", client, "nomic-embed-text")
 	if err != nil {
@@ -154,10 +160,20 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			return
 		}
 		list, _ := store.List()
-		if list == nil {
-			list = []SessionMeta{}
+
+		// По умолчанию фильтруем агент-сессии (agent_ prefix).
+		// Передай ?include_agent=true чтобы увидеть их тоже.
+		includeAgent := r.URL.Query().Get("include_agent") == "true"
+		var filtered []SessionMeta
+		for _, s := range list {
+			if includeAgent || !strings.HasPrefix(s.ID, "agent_") {
+				filtered = append(filtered, s)
+			}
 		}
-		jsonOK(w, list)
+		if filtered == nil {
+			filtered = []SessionMeta{}
+		}
+		jsonOK(w, filtered)
 	}))
 
 	mux.Handle("/api/sessions/", protected(func(w http.ResponseWriter, r *http.Request) {
@@ -356,8 +372,14 @@ func runServer(ollamaURL, defaultModel, port, dataDir string) {
 			http.Error(w, "bad request", 400)
 			return
 		}
-		if body.SessionID == "" {
-			body.SessionID = "agent_" + body.SessionID
+		// Агент-сессии всегда хранятся с префиксом "agent_", чтобы не смешиваться
+		// с обычными сессиями в /api/sessions.
+		if !strings.HasPrefix(body.SessionID, "agent_") {
+			if body.SessionID == "" {
+				body.SessionID = "agent_default"
+			} else {
+				body.SessionID = "agent_" + body.SessionID
+			}
 		}
 
 		sess, err := store.GetOrCreate(body.SessionID, defaultModel, agentSystemPrompt())
@@ -813,9 +835,22 @@ func extractText(data []byte, filename string) string {
 		return text
 	}
 
-	// DOCX/DOC не поддерживаются без внешних утилит
-	if strings.HasSuffix(lower, ".docx") || strings.HasSuffix(lower, ".doc") {
-		return "[DOCX/DOC не поддерживаются. Пожалуйста, сохрани документ в TXT или MD.]"
+	// DOCX: читаем через archive/zip + encoding/xml (stdlib, без зависимостей)
+	if strings.HasSuffix(lower, ".docx") {
+		text, err := extractDOCX(data)
+		if err != nil {
+			return "[DOCX: " + err.Error() + "]"
+		}
+		return text
+	}
+
+	// DOC (старый бинарный формат Microsoft Word): пробуем antiword
+	if strings.HasSuffix(lower, ".doc") {
+		text, err := extractDOC(data)
+		if err != nil {
+			return "[DOC: " + err.Error() + ". Установи antiword или сохрани документ в DOCX/TXT.]"
+		}
+		return text
 	}
 
 	// Всё остальное — текст
@@ -893,4 +928,108 @@ func stripHTMLTags(html string) string {
 	}
 	// Схлопываем лишние пробелы
 	return strings.Join(strings.Fields(sb.String()), " ")
+}
+
+// extractDOCX извлекает текст из DOCX-файла (ZIP + XML) без внешних зависимостей.
+//
+// DOCX — это ZIP-архив. Текст хранится в word/document.xml в элементах <w:t>.
+// Параграфы разделяются переносом строки.
+func extractDOCX(data []byte) (string, error) {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("не удалось открыть DOCX как ZIP: %w", err)
+	}
+
+	// Ищем word/document.xml в архиве
+	var xmlData []byte
+	for _, f := range r.File {
+		if f.Name == "word/document.xml" {
+			rc, err := f.Open()
+			if err != nil {
+				return "", fmt.Errorf("открытие word/document.xml: %w", err)
+			}
+			xmlData, err = io.ReadAll(io.LimitReader(rc, 16*1024*1024)) // макс 16 MB
+			rc.Close()
+			if err != nil {
+				return "", fmt.Errorf("чтение word/document.xml: %w", err)
+			}
+			break
+		}
+	}
+	if xmlData == nil {
+		return "", fmt.Errorf("word/document.xml не найден — файл повреждён или не является DOCX")
+	}
+
+	// Парсим XML: собираем текст из <w:t> и разделяем параграфы <w:p>
+	var sb strings.Builder
+	dec := xml.NewDecoder(bytes.NewReader(xmlData))
+	inPara := false
+
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// Некорректный XML — возвращаем что успели собрать
+			break
+		}
+
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "p": // <w:p> — параграф
+				inPara = true
+			case "br": // <w:br> — перенос строки внутри параграфа
+				sb.WriteByte('\n')
+			}
+		case xml.EndElement:
+			if t.Name.Local == "p" && inPara {
+				sb.WriteByte('\n')
+				inPara = false
+			}
+		case xml.CharData:
+			// Текст вне <w:t> может быть служебным — пропускаем через родительский элемент.
+			// xml.Decoder автоматически вызывает CharData только для текстовых узлов.
+			sb.Write([]byte(t))
+		}
+	}
+
+	text := strings.TrimSpace(sb.String())
+	if text == "" {
+		return "", fmt.Errorf("документ не содержит текста")
+	}
+	return text, nil
+}
+
+// extractDOC извлекает текст из .doc (старый формат Word) через antiword.
+// Возвращает ошибку если antiword не установлен.
+func extractDOC(data []byte) (string, error) {
+	if !commandExists("antiword") {
+		return "", fmt.Errorf("antiword не найден")
+	}
+
+	// antiword читает из файла, не из stdin — пишем во временный файл
+	tmp, err := os.CreateTemp("", "localai-*.doc")
+	if err != nil {
+		return "", fmt.Errorf("временный файл: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return "", err
+	}
+	tmp.Close()
+
+	out, err := runCommand("antiword", tmp.Name())
+	if err != nil {
+		return "", fmt.Errorf("antiword: %w", err)
+	}
+
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		return "", fmt.Errorf("документ не содержит текста")
+	}
+	return text, nil
 }

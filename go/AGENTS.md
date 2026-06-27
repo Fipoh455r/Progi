@@ -1,0 +1,130 @@
+# go/AGENTS.md — Go-проект LocalAI
+
+> Область действия: всё в директории `go/`. ~300 токенов.
+> Прочитал `../AGENTS.md`? Если нет — прочитай его первым.
+
+---
+
+## ФАЙЛОВАЯ КАРТА
+
+```
+main.go       CLI точка входа. AppVersion="3.1.0". Команды: chat|serve|models|pull|config
+              Приоритет конфига: -flag > ENV > localai.yaml > DefaultConfig()
+config.go     AppConfig{OllamaURL,Model,Port,DataDir,WhisperURL,...}
+              LoadConfig(path) → MergeEnv() → CLI-флаги
+              WriteExample(path) — создаёт localai.yaml
+os_exec.go    runCommand(name,args) → []byte,error
+              runCommandExists(name) → bool
+ollama.go     OllamaClient{baseURL,http}
+              ChatStreamWithTemp(ctx,msgs,model,temp) → (tokenCh,errCh)
+              ListModels() → []ModelInfo    IsAvailable() → bool
+storage.go    Session{SessionMeta{ID,Title,Settings,CreatedAt},Messages[]Message}
+              Storage.GetOrCreate / AppendAndSave / Load / Save / Delete / List
+compress.go   CompressHistory(ctx,client,msgs,model) → (msgs,bool,err)
+              TrimToTokenBudget(msgs,budget)   EstimateTokens(msgs) → int
+              maxHistoryMessages=24  keepRecentMessages=8  agentTokenBudget=3500
+tools.go      AllTools map[string]*ToolDef   RunTool(name,args) → (string,error)
+              ToolsPrompt() → string   (6 инструментов)
+agent.go      RunAgent(ctx,client,msgs,model,temp,stepCh) → (string,error)
+              ReAct-цикл: maxAgentSteps=8   AgentStep{Kind,Content,ToolName,...}
+rag.go        RAG.AddDocument(ctx,name,text) → (chunks,err)   [batch parallel ×4]
+              RAG.Search(ctx,query,topK) → []SearchResult   порог=0.3
+              BuildContextString(results) → string
+server.go     runServer(url,model,port,dataDir)  v3.1
+              HTTP сервер с graceful shutdown (SIGTERM/SIGINT → 10s drain)
+              extractText(data,filename) — .pdf через pdftotext, .html strip tags
+openai.go     registerOpenAIRoutes → GET /v1/models  POST /v1/chat/completions
+auth.go       UserStore(JSON)  HashPassword(PBKDF2-HMAC-SHA256-100k)
+              GenerateJWT / ValidateJWT (HS256, 24h)
+              RateLimiter(per-IP sliding window)
+              RequireAuth(secret) / RequireAdmin(secret) → http.Handler middleware
+audio.go      WhisperClient.Transcribe(ctx,file) → string   [proxy к Whisper HTTP]
+              PiperTTS.Synthesize(text,voice) → []byte      [exec piper binary]
+              registerAudioRoutes: /api/audio/transcriptions, /speech, /status
+balancer.go   OllamaBalancer: round-robin + circuit breaker (3 fails → down, 60s recovery)
+              NewOllamaBalancer(primaryURL) — читает LOCALAI_OLLAMA_NODES (запятая)
+              Pick() / ReportSuccess(client) / ReportFailure(client) / HealthyCount()
+              health check: каждые 15 сек в фоне
+metrics.go    NewMetrics(balancer) → *Metrics   registerMetricsRoute → GET /metrics
+              Prometheus text 0.0.4, 0 зависимостей
+              Счётчики: ChatReqs,AgentReqs,Tokens,Uploads,LoginOK,LoginFail,ChatErrs,AgentErrs
+              Гистограммы: ChatDuration,AgentDuration   Gauge: ActiveConns,HealthyNodes
+```
+
+---
+
+## ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+
+```
+OLLAMA_URL              http://localhost:11434
+LOCALAI_MODEL           qwen2.5:0.5b
+LOCALAI_PORT            8080
+LOCALAI_DATA            ./data
+LOCALAI_OLLAMA_NODES    url1,url2,url3   (балансировщик)
+LOCALAI_WHISPER_URL     http://localhost:8081
+LOCALAI_PIPER_BIN       /usr/bin/piper
+LOCALAI_PIPER_VOICES_DIR ./data/voices
+LOCALAI_PIPER_VOICE     en_US-lessac-medium
+LOCALAI_JWT_SECRET      (пустое = авто-генерация)
+LOCALAI_METRICS_ENABLED true
+```
+
+---
+
+## КОМАНДЫ
+
+```bash
+go build -o /dev/null ./...          # проверка компиляции (ВСЕГДА перед коммитом)
+go test ./...                        # 26 тестов (ВСЕГДА перед коммитом)
+go test -run TestXxx -v              # запустить один тест
+go build -ldflags="-w -s" -o /tmp/localai .   # итоговый бинарник ~6.5MB
+```
+
+---
+
+## ТИПИЧНЫЕ ЗАДАЧИ
+
+```
+Новый инструмент агента:
+  → tools.go: AllTools["name"] = &ToolDef{Name, Description, ArgsSchema, Run: func}
+  → агент подхватит автоматически (ToolsPrompt включает его в системный промпт)
+
+Новый API-маршрут (с авторизацией):
+  → server.go: mux.Handle("/api/...", protected(func(w, r) { ... }))
+  → для admin: adminOnly(handler)   для публичного: mux.HandleFunc(...)
+
+Новый конфиг-параметр:
+  → config.go: добавь поле в AppConfig → парси в LoadConfig kv["ключ"] → добавь в MergeEnv
+  → main.go: добавь флаг и передай в runServer если нужно
+
+Новый тест:
+  → *_test.go рядом с тестируемым файлом, пакет main
+  → go test -run TestИмя -v
+
+Изменить RAG-параметры:
+  → rag.go: chunkText(400, 60) → (targetWords, overlap)
+  → server.go: rag.Search(ctx, msg, 4) → topK
+```
+
+---
+
+## ЧАСТЫЕ ОШИБКИ
+
+```
+duplicate func     → проверь все *_test.go и os_exec.go
+go:embed missing   → static/index.html должен существовать до go build
+SSE не работает    → X-Accel-Buffering: no (уже в server.go)
+JWT 401            → Bearer токен в заголовке Authorization
+PDF пустой         → pdftotext не установлен (apt install poppler-utils)
+config parse error → двоеточие в значении → взять в кавычки: "http://host:port"
+```
+
+---
+
+## СТРУКТУРА ТЕСТОВ
+
+```
+tools_test.go    TestEvalExpr_* / TestTool* / TestRunTool* / TestToolsPrompt
+compress_test.go TestEstimateTokens_* / TestTrimToTokenBudget_*
+config_test.go   TestDefaultConfig / TestLoadConfig_* / TestWriteExample / TestParseBool / TestMergeEnv
+```

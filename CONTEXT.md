@@ -31,6 +31,10 @@ server.go   runServer(url,model,port,dataDir)  v2.0
 openai.go   registerOpenAIRoutes(mux,client,model)  /v1/models /v1/chat/completions
 auth.go     (v2.2) UserStore  HashPassword  JWT HS256  RateLimiter  RequireAuth
 audio.go    (v2.3) WhisperClient.Transcribe / PiperTTS.Synthesize / registerAudioRoutes
+balancer.go (v3.0) OllamaBalancer: Pick()/Primary()/ReportSuccess/Failure/HealthyCount
+            NewOllamaBalancer(primary) → env LOCALAI_OLLAMA_NODES  round-robin+circuit
+metrics.go  (v3.0) Metrics{counters,histograms}  ServeHTTP → Prometheus text 0.0.4
+            registerMetricsRoute → GET /metrics
 static/index.html  SPA: sidebar+агент+RAG+настройки+логин+🎤 кнопка (v2.3)
 Dockerfile  multi-stage golang:1.21→alpine:3.19  VOLUME /app/data
 go.mod      module github.com/Fipoh455r/Progi/go  go 1.21
@@ -72,7 +76,8 @@ OpenAI compat (auth required):
 v1.0-v2.1  ✅  (чат, хранилище, UI, RAG, агент, OpenAI API)
 v2.2       ✅  Авторизация (JWT+PBKDF2+RateLimiting)
 v2.3       ✅  Голос (Whisper STT proxy + piper TTS + MediaRecorder UI)
-v3.0       ⬜  Кластер (балансировка + Helm + Prometheus) ← СЛЕДУЮЩАЯ
+v3.0       ✅  Кластер (OllamaBalancer + Prometheus + Helm)
+Далее      ⬜  Технический долг (тесты, graceful shutdown, YAML config)
 ```
 
 ## БЫСТРЫЙ СТАРТ

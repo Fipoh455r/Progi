@@ -1,27 +1,61 @@
 version: "3.8"
 
 # ============================================================
-#  LocalAI — локальный AI-ассистент без облака
+#  LocalAI v3.0 — локальный AI-ассистент без облака
 #  Работает на любом Linux с Docker
-#  Использует Ollama (движок) + Open WebUI (интерфейс)
+#
+#  Варианты запуска:
+#    docker compose up                    # одна нода Ollama
+#    docker compose --profile multi up    # две ноды Ollama (балансировка)
+#    docker compose --profile whisper up  # + Whisper STT
 # ============================================================
 
 services:
 
-  # --- Ollama: движок для запуска локальных LLM ---
+  # --- Go-приложение LocalAI ---
+  localai:
+    build:
+      context: ./go
+      dockerfile: Dockerfile
+    image: ghcr.io/fipoh455r/progi:3.0
+    container_name: localai-app
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - LOCALAI_MODEL=qwen2.5:0.5b
+      - LOCALAI_PORT=8080
+      - LOCALAI_DATA=/app/data
+      # Балансировка нескольких нод (раскомментировать при использовании профиля multi):
+      # - LOCALAI_OLLAMA_NODES=http://ollama:11434,http://ollama2:11434
+      # JWT-секрет (оставить "" — автогенерируется):
+      # - LOCALAI_JWT_SECRET=your-very-secret-key-here
+      # Whisper STT (раскомментировать при использовании профиля whisper):
+      # - LOCALAI_WHISPER_URL=http://whisper:8080
+    volumes:
+      - localai-data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- Ollama: основная нода LLM ---
   ollama:
     image: ollama/ollama:latest
     container_name: localai-ollama
     restart: unless-stopped
     volumes:
-      # Хранилище моделей — сохраняется между перезапусками
       - ollama-models:/root/.ollama
     ports:
-      - "11434:11434"       # API Ollama (для других программ)
+      - "11434:11434"
     environment:
       - OLLAMA_KEEP_ALIVE=24h
-      - OLLAMA_NUM_PARALLEL=1
-    # Использовать GPU (NVIDIA) — если нет GPU, просто игнорируется
+      - OLLAMA_NUM_PARALLEL=2
     deploy:
       resources:
         reservations:
@@ -36,34 +70,31 @@ services:
       retries: 5
       start_period: 30s
 
-  # --- Open WebUI: красивый веб-интерфейс для чата ---
-  webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: localai-webui
+  # --- Ollama: вторая нода (профиль multi) ---
+  ollama2:
+    image: ollama/ollama:latest
+    container_name: localai-ollama2
     restart: unless-stopped
-    depends_on:
-      ollama:
-        condition: service_healthy
-    ports:
-      - "3000:8080"         # Открыть браузер: http://localhost:3000
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - WEBUI_SECRET_KEY=localai-secret-change-me
-      - ENABLE_SIGNUP=true
-      - DEFAULT_LOCALE=ru
-      - WEBUI_NAME=LocalAI
+    profiles: [multi]
     volumes:
-      - webui-data:/app/backend/data
+      - ollama-models2:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_NUM_PARALLEL=2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
-  # --- Загрузчик модели: запускается один раз и скачивает модель ---
+  # --- Загрузчик модели ---
   model-loader:
     image: curlimages/curl:latest
     container_name: localai-model-loader
     depends_on:
       ollama:
         condition: service_healthy
-    # qwen2.5:0.5b — очень лёгкая модель (~400MB), работает на слабом железе
-    # Для более мощных ПК можно заменить на: llama3.2:1b или mistral:7b
     entrypoint: >
       sh -c "
         echo 'Загрузка модели qwen2.5:0.5b (~400MB)...' &&
@@ -75,8 +106,46 @@ services:
       "
     restart: "no"
 
+  # --- Whisper STT (профиль whisper) ---
+  whisper:
+    image: onerahmet/openai-whisper-asr-webservice:latest
+    container_name: localai-whisper
+    restart: unless-stopped
+    profiles: [whisper]
+    ports:
+      - "8081:8080"
+    environment:
+      - ASR_MODEL=base        # tiny | base | small | medium | large
+      - ASR_ENGINE=openai_whisper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # --- Prometheus (профиль monitoring) ---
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: localai-prometheus
+    restart: unless-stopped
+    profiles: [monitoring]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+
 volumes:
+  localai-data:
+    driver: local
   ollama-models:
     driver: local
-  webui-data:
+  ollama-models2:
+    driver: local
+  prometheus-data:
     driver: local

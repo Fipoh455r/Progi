@@ -8,11 +8,14 @@
 ## ФАЙЛОВАЯ КАРТА
 
 ```
-main.go       CLI точка входа. AppVersion="3.1.0". Команды: chat|serve|models|pull|config
+main.go       CLI точка входа. AppVersion="3.2.0". Команды: chat|serve|models|pull|config
               Приоритет конфига: -flag > ENV > localai.yaml > DefaultConfig()
-config.go     AppConfig{OllamaURL,Model,Port,DataDir,WhisperURL,...}
+              Флаги: -config -ollama -model -port -data -log
+config.go     AppConfig{OllamaURL,Model,Port,DataDir,WhisperURL,...,LogFile}
               LoadConfig(path) → MergeEnv() → CLI-флаги
               WriteExample(path) — создаёт localai.yaml
+logger.go     InitLogger(path) → error   — лог в файл + stderr, ротация >10MB → .gz
+              rotateSize=10MB  maxBackups=5   gzipFile / pruneBackups
 os_exec.go    runCommand(name,args) → []byte,error
               runCommandExists(name) → bool
 ollama.go     OllamaClient{baseURL,http}
@@ -24,15 +27,19 @@ compress.go   CompressHistory(ctx,client,msgs,model) → (msgs,bool,err)
               TrimToTokenBudget(msgs,budget)   EstimateTokens(msgs) → int
               maxHistoryMessages=24  keepRecentMessages=8  agentTokenBudget=3500
 tools.go      AllTools map[string]*ToolDef   RunTool(name,args) → (string,error)
-              ToolsPrompt() → string   (6 инструментов)
+              ToolsPrompt() → string   (7 инструментов: +memory)
+              SetMemoryDir(dataDir) — инициализирует директорию памяти
+              memory: save|load|list|delete факты в data/memory/facts.json
 agent.go      RunAgent(ctx,client,msgs,model,temp,stepCh) → (string,error)
               ReAct-цикл: maxAgentSteps=8   AgentStep{Kind,Content,ToolName,...}
 rag.go        RAG.AddDocument(ctx,name,text) → (chunks,err)   [batch parallel ×4]
               RAG.Search(ctx,query,topK) → []SearchResult   порог=0.3
               BuildContextString(results) → string
-server.go     runServer(url,model,port,dataDir)  v3.1
+server.go     runServer(url,model,port,dataDir)  v3.2
               HTTP сервер с graceful shutdown (SIGTERM/SIGINT → 10s drain)
-              extractText(data,filename) — .pdf через pdftotext, .html strip tags
+              extractText: .pdf(pdftotext) .docx(stdlib ZIP+XML) .doc(antiword) .html(strip)
+              /api/sessions: фильтрует agent_ сессии; ?include_agent=true — показать все
+              /api/agent: исправлен баг agent_ prefix (был "agent_", теперь "agent_<id>")
 openai.go     registerOpenAIRoutes → GET /v1/models  POST /v1/chat/completions
 auth.go       UserStore(JSON)  HashPassword(PBKDF2-HMAC-SHA256-100k)
               GenerateJWT / ValidateJWT (HS256, 24h)
@@ -67,6 +74,7 @@ LOCALAI_PIPER_VOICES_DIR ./data/voices
 LOCALAI_PIPER_VOICE     en_US-lessac-medium
 LOCALAI_JWT_SECRET      (пустое = авто-генерация)
 LOCALAI_METRICS_ENABLED true
+LOCALAI_LOG_FILE        (пустое = только stderr; пример: /var/log/localai/app.log)
 ```
 
 ---

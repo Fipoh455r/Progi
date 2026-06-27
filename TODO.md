@@ -4,41 +4,37 @@
 
 ---
 
-## СЕЙЧАС (v3.1 в PR#4)
+## СЕЙЧАС (v3.2 в PR#5)
 
-- [x] Graceful shutdown (SIGTERM → 10s drain)
-- [x] YAML config (`localai config init`, `-config path`)
-- [x] Unit-тесты (26 шт: tools, compress, config)
-- [x] PDF через pdftotext
-- [x] Batch embedding (семафор ×4)
-- [x] AGENTS.md + go/AGENTS.md (AI-навигация, экономия токенов)
+- [x] Логирование в файл с ротацией
+  - `logger.go`: `InitLogger(path)` + `fileLogger.Write` с ротацией >10MB → gzip
+  - флаг `-log path` и `log_file` в localai.yaml; env `LOCALAI_LOG_FILE`
+- [x] Исправлен баг agent-сессий (`agent_` prefix)
+  - `agent_default` если пустой ID, `agent_<id>` если задан
+  - `/api/sessions` фильтрует agent_ по умолчанию; `?include_agent=true` — показать
+- [x] DOCX поддержка (stdlib ZIP+XML, без зависимостей)
+  - `.docx` — pure Go: `archive/zip` + `encoding/xml`
+  - `.doc` — через `antiword` (если установлен)
+- [x] Инструмент агента `memory`
+  - операции: `save | load | list | delete`
+  - хранит факты в `data/memory/facts.json`
 
-**Статус PR#4:** https://github.com/Fipoh455r/Progi/pull/4
+**Статус PR#5:** https://github.com/Fipoh455r/Progi/pull/5 (стакован: PR#4 → PR#5)
 
 ---
 
-## СЛЕДУЮЩИЕ ЗАДАЧИ (v3.2)
+## СЛЕДУЮЩИЕ ЗАДАЧИ (v3.3)
 
-### Приоритет 1 — Технический долг
-
-- [ ] Логирование в файл с ротацией
-  - `log/slog` → файл + ротация по размеру (>10MB → gzip)
-  - флаг `-log path` или `log_file` в localai.yaml
-- [ ] Исправить: агент-сессии (`agent_` prefix) видны отдельно от обычных
-  - в `/api/sessions` → фильтровать или объединить
-- [ ] DOCX поддержка (`antiword` или `docx2txt`)
-
-### Приоритет 2 — UI
+### Приоритет 1 — UI
 
 - [ ] Тёмная/светлая тема (CSS переменные + toggle)
 - [ ] Мобильный вид (responsive breakpoints)
 - [ ] Экспорт истории в Markdown/JSON
 - [ ] Поиск по истории диалогов
 
-### Приоритет 3 — Новые инструменты агента
+### Приоритет 2 — Новые инструменты агента
 
 - [ ] `shell_exec` — выполнение shell-команд (с подтверждением пользователя)
-- [ ] `memory` — долгосрочная память (JSON-файл с фактами о пользователе)
 - [ ] `code_run` — запуск Python в изолированной среде
 
 ---
@@ -52,3 +48,4 @@
 | v2.3 | PR#2 | голос Whisper+piper |
 | v3.0 | PR#3 | кластер: балансировщик+Prometheus+Helm |
 | v3.1 | PR#4 | техдолг: shutdown+config+тесты+PDF+batch |
+| v3.2 | PR#5 | лог в файл, фикс agent-сессий, DOCX, memory |

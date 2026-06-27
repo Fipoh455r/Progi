@@ -1,12 +1,14 @@
 // tools.go — встроенные инструменты агента.
 //
 // Инструменты:
-//   calculator  — вычисление математических выражений (без CGO)
-//   datetime    — текущая дата и время
-//   web_search  — поиск через DuckDuckGo (без API-ключа)
-//   read_file   — чтение файла с диска
-//   write_file  — запись файла на диск
-//   http_get    — HTTP GET запрос
+//
+//	calculator  — вычисление математических выражений (без CGO)
+//	datetime    — текущая дата и время
+//	web_search  — поиск через DuckDuckGo (без API-ключа)
+//	read_file   — чтение файла с диска
+//	write_file  — запись файла на диск
+//	http_get    — HTTP GET запрос
+//	memory      — долгосрочная память (JSON-файл с фактами о пользователе)
 package main
 
 import (
@@ -20,9 +22,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
+
+// memoryDataDir — директория для хранения файла памяти агента.
+// Устанавливается через SetMemoryDir при старте сервера.
+var memoryDataDir string
+
+// SetMemoryDir инициализирует директорию для хранения памяти агента.
+// Должна вызываться до первого использования инструмента memory.
+func SetMemoryDir(dataDir string) {
+	memoryDataDir = filepath.Join(dataDir, "memory")
+}
 
 // ToolDef описывает один инструмент.
 type ToolDef struct {
@@ -69,6 +82,12 @@ var AllTools = map[string]*ToolDef{
 		Description: "Выполняет HTTP GET запрос и возвращает тело ответа (до 4KB)",
 		ArgsSchema:  `{"url": "https://..."}`,
 		Run:         toolHTTPGet,
+	},
+	"memory": {
+		Name:        "memory",
+		Description: "Долгосрочная память: сохраняй и загружай факты о пользователе между сессиями",
+		ArgsSchema:  `{"action": "save|load|list|delete", "key": "название факта", "value": "значение (только для save)"}`,
+		Run:         toolMemory,
 	},
 }
 
@@ -535,6 +554,154 @@ func toolHTTPGet(args map[string]any) (string, error) {
 }
 
 // ── RunTool ────────────────────────────────────────────────────────────────
+
+// ── memory ─────────────────────────────────────────────────────────────────
+
+// memoryStore — мьютекс для безопасного доступа к файлу памяти.
+var memoryMu sync.Mutex
+
+// memoryFacts — структура файла памяти.
+type memoryFacts struct {
+	Facts map[string]string `json:"facts"`
+}
+
+// memoryFilePath возвращает путь к файлу памяти.
+func memoryFilePath() (string, error) {
+	if memoryDataDir == "" {
+		return "", fmt.Errorf("память недоступна: сервер не инициализирован (запусти localai serve)")
+	}
+	return filepath.Join(memoryDataDir, "facts.json"), nil
+}
+
+// loadFacts читает факты с диска.
+func loadFacts() (memoryFacts, error) {
+	path, err := memoryFilePath()
+	if err != nil {
+		return memoryFacts{}, err
+	}
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return memoryFacts{Facts: make(map[string]string)}, nil
+	}
+	if err != nil {
+		return memoryFacts{}, fmt.Errorf("чтение памяти: %w", err)
+	}
+
+	var mf memoryFacts
+	if err := json.Unmarshal(data, &mf); err != nil {
+		return memoryFacts{Facts: make(map[string]string)}, nil
+	}
+	if mf.Facts == nil {
+		mf.Facts = make(map[string]string)
+	}
+	return mf, nil
+}
+
+// saveFacts записывает факты на диск (атомарно через temp-файл).
+func saveFacts(mf memoryFacts) error {
+	path, err := memoryFilePath()
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("создание директории памяти: %w", err)
+	}
+
+	data, err := json.MarshalIndent(mf, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// toolMemory реализует операции над долгосрочной памятью агента.
+//
+//	save  — сохранить факт:  {"action":"save","key":"имя","value":"Иван"}
+//	load  — загрузить факт:  {"action":"load","key":"имя"}
+//	list  — все факты:       {"action":"list"}
+//	delete — удалить факт:  {"action":"delete","key":"имя"}
+func toolMemory(args map[string]any) (string, error) {
+	action, _ := args["action"].(string)
+	key, _ := args["key"].(string)
+	value, _ := args["value"].(string)
+
+	if action == "" {
+		return "", fmt.Errorf("нужен аргумент 'action': save | load | list | delete")
+	}
+
+	memoryMu.Lock()
+	defer memoryMu.Unlock()
+
+	mf, err := loadFacts()
+	if err != nil {
+		return "", err
+	}
+
+	switch action {
+	case "save":
+		if key == "" {
+			return "", fmt.Errorf("нужен аргумент 'key'")
+		}
+		if value == "" {
+			return "", fmt.Errorf("нужен аргумент 'value'")
+		}
+		mf.Facts[key] = value
+		if err := saveFacts(mf); err != nil {
+			return "", fmt.Errorf("сохранение факта: %w", err)
+		}
+		return fmt.Sprintf("Запомнено: %s = %s", key, value), nil
+
+	case "load":
+		if key == "" {
+			// Без ключа — все факты
+			return formatFacts(mf.Facts), nil
+		}
+		v, ok := mf.Facts[key]
+		if !ok {
+			return fmt.Sprintf("Факт %q не найден в памяти", key), nil
+		}
+		return fmt.Sprintf("%s: %s", key, v), nil
+
+	case "list":
+		return formatFacts(mf.Facts), nil
+
+	case "delete":
+		if key == "" {
+			return "", fmt.Errorf("нужен аргумент 'key'")
+		}
+		if _, ok := mf.Facts[key]; !ok {
+			return fmt.Sprintf("Факт %q не найден", key), nil
+		}
+		delete(mf.Facts, key)
+		if err := saveFacts(mf); err != nil {
+			return "", fmt.Errorf("удаление факта: %w", err)
+		}
+		return fmt.Sprintf("Факт %q удалён", key), nil
+
+	default:
+		return "", fmt.Errorf("неизвестное действие %q; допустимо: save, load, list, delete", action)
+	}
+}
+
+// formatFacts форматирует карту фактов в читаемую строку.
+func formatFacts(facts map[string]string) string {
+	if len(facts) == 0 {
+		return "Память пуста"
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Фактов в памяти: %d\n", len(facts)))
+	for k, v := range facts {
+		sb.WriteString(fmt.Sprintf("• %s: %s\n", k, v))
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
 
 // RunTool выполняет инструмент по имени с заданными аргументами.
 func RunTool(name string, args map[string]any) (string, error) {

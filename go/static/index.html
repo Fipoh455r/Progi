@@ -36,6 +36,9 @@ select:focus{outline:none;border-color:var(--acc)}
 #hamburger{display:none}
 /* Режим агента */
 .mode-badge{font-size:.7rem;padding:2px 6px;border-radius:10px;background:var(--pur);color:#fff;font-weight:600}
+/* Пользователь в хедере */
+#user-badge{font-size:.78rem;color:var(--dim);display:flex;align-items:center;gap:5px}
+#user-badge strong{color:var(--txt)}
 
 /* Layout */
 .main{display:flex;flex:1;overflow:hidden}
@@ -160,10 +163,10 @@ details.step-card summary::-webkit-details-marker{display:none}
 .sp-field textarea{width:100%;background:var(--sur2);color:var(--txt);
   border:1px solid var(--bor);border-radius:6px;padding:8px 10px;
   font-size:.82rem;resize:vertical;min-height:90px;font-family:inherit;line-height:1.5}
-.sp-field textarea:focus,.sp-field input[type=text]:focus{outline:none;border-color:var(--acc)}
+.sp-field textarea:focus,.sp-field input[type=text]:focus,.sp-field input[type=password]:focus{outline:none;border-color:var(--acc)}
 .sp-field .row{display:flex;justify-content:space-between;align-items:center}
 .sp-field input[type=range]{width:100%;margin-top:4px}
-.sp-field input[type=text]{width:100%;background:var(--sur2);color:var(--txt);
+.sp-field input[type=text],.sp-field input[type=password]{width:100%;background:var(--sur2);color:var(--txt);
   border:1px solid var(--bor);border-radius:6px;padding:7px 10px;font-size:.85rem}
 .sp-presets{display:flex;flex-wrap:wrap;gap:5px;margin-top:5px}
 .preset-btn{font-size:.75rem;padding:3px 8px;background:var(--sur2);
@@ -171,6 +174,24 @@ details.step-card summary::-webkit-details-marker{display:none}
 .preset-btn:hover{border-color:var(--acc);color:var(--acc)}
 #overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99}
 #overlay.on{display:block}
+
+/* ── Авторизация ── */
+#auth-overlay{display:none;position:fixed;inset:0;background:var(--bg);
+  z-index:300;align-items:center;justify-content:center}
+#auth-overlay.on{display:flex}
+.auth-card{background:var(--sur);border:1px solid var(--bor);border-radius:12px;
+  padding:32px;width:360px;max-width:90vw;display:flex;flex-direction:column;gap:20px}
+.auth-card h1{font-size:1.4rem;font-weight:700;color:var(--acc);letter-spacing:1px;text-align:center}
+.auth-card h1 em{color:var(--red);font-style:normal}
+.auth-card h2{font-size:1rem;font-weight:600;text-align:center;color:var(--txt)}
+.auth-card p.hint{font-size:.8rem;color:var(--dim);text-align:center;line-height:1.5}
+.auth-field{display:flex;flex-direction:column;gap:6px}
+.auth-field label{font-size:.78rem;color:var(--dim);font-weight:600}
+.auth-field input{background:var(--sur2);color:var(--txt);border:1px solid var(--bor);
+  border-radius:6px;padding:9px 12px;font-size:.9rem;outline:none}
+.auth-field input:focus{border-color:var(--acc);box-shadow:0 0 0 2px rgba(88,166,255,.12)}
+#auth-error{font-size:.8rem;color:var(--red);text-align:center;min-height:1.2em}
+.auth-card .btn.prim{padding:10px;font-size:.9rem}
 
 /* Скроллбар */
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -188,6 +209,44 @@ details.step-card summary::-webkit-details-marker{display:none}
 </head>
 <body>
 
+<!-- ── Оверлей авторизации ── -->
+<div id="auth-overlay">
+  <div class="auth-card">
+    <h1>⚡ LOCAL<em>AI</em></h1>
+
+    <!-- Форма первой настройки -->
+    <div id="auth-setup" style="display:none;flex-direction:column;gap:16px">
+      <h2>Первый запуск</h2>
+      <p class="hint">Создай учётную запись администратора для доступа к системе.</p>
+      <div class="auth-field">
+        <label>Логин</label>
+        <input type="text" id="setup-user" placeholder="admin" autocomplete="username">
+      </div>
+      <div class="auth-field">
+        <label>Пароль (мин. 6 символов)</label>
+        <input type="password" id="setup-pass" placeholder="••••••••" autocomplete="new-password">
+      </div>
+      <div id="auth-error"></div>
+      <button class="btn prim" onclick="doSetup()">Создать и войти</button>
+    </div>
+
+    <!-- Форма входа -->
+    <div id="auth-login" style="display:none;flex-direction:column;gap:16px">
+      <h2>Вход</h2>
+      <div class="auth-field">
+        <label>Логин</label>
+        <input type="text" id="login-user" placeholder="username" autocomplete="username">
+      </div>
+      <div class="auth-field">
+        <label>Пароль</label>
+        <input type="password" id="login-pass" placeholder="••••••••" autocomplete="current-password">
+      </div>
+      <div id="auth-error"></div>
+      <button class="btn prim" onclick="doLogin()">Войти</button>
+    </div>
+  </div>
+</div>
+
 <header>
   <button class="btn icon" id="hamburger" onclick="toggleSidebar()">☰</button>
   <span class="logo">⚡ LOCAL<em>AI</em></span>
@@ -196,6 +255,8 @@ details.step-card summary::-webkit-details-marker{display:none}
   <select id="model-sel" onchange="onModelChange()"></select>
   <button class="btn icon" id="agent-toggle" onclick="toggleAgentMode()" title="Режим агента с инструментами">🤖</button>
   <button class="btn icon" onclick="openSettings()" title="Настройки">⚙</button>
+  <span id="user-badge" style="display:none"><strong id="user-name"></strong></span>
+  <button class="btn icon" id="logout-btn" onclick="logout()" title="Выйти" style="display:none">⏏</button>
 </header>
 
 <!-- Зона перетаскивания файлов -->
@@ -230,7 +291,7 @@ details.step-card summary::-webkit-details-marker{display:none}
     <div id="messages">
       <div class="msg ai">
         <div class="av">🤖</div>
-        <div class="bubble"><p>Привет! Я <strong>LocalAI v2.0</strong> — локальный AI-агент.<br>
+        <div class="bubble"><p>Привет! Я <strong>LocalAI v2.2</strong> — локальный AI-агент.<br>
         Работаю без интернета. В режиме <strong>агента</strong> (🤖) могу использовать инструменты:<br>
         • Поиск в интернете · Вычисления · Дата/время · Чтение файлов<br>
         Загрузи документы (📚) чтобы я мог отвечать по ним.</p></div>
@@ -283,6 +344,20 @@ details.step-card summary::-webkit-details-marker{display:none}
       <label>🔧 Инструменты агента</label>
       <div id="tools-list" style="font-size:.8rem;color:var(--dim);line-height:1.8">Загрузка...</div>
     </div>
+
+    <!-- Управление пользователями (только admin) -->
+    <div class="sp-field" id="admin-section" style="display:none;margin-top:8px;border-top:1px solid var(--bor);padding-top:12px">
+      <label>👤 Новый пользователь</label>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+        <input type="text" id="new-user" placeholder="Логин">
+        <input type="password" id="new-pass" placeholder="Пароль (мин. 6 символов)">
+        <select id="new-role" style="background:var(--sur2);color:var(--txt);border:1px solid var(--bor);border-radius:6px;padding:7px 10px;font-size:.85rem">
+          <option value="user">user</option>
+          <option value="admin">admin</option>
+        </select>
+        <button class="btn" onclick="createUser()">Создать пользователя</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -297,6 +372,169 @@ let docsOpen = false;
 const $  = id  => document.getElementById(id);
 const esc = s  => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const setStatus = (msg, spd) => { $('st-info').textContent = msg; $('st-speed').textContent = spd||''; };
+
+// ── Авторизация ───────────────────────────────────────────────────────
+
+const TOKEN_KEY = 'localai_token';
+const ROLE_KEY  = 'localai_role';
+
+function getToken(){ return localStorage.getItem(TOKEN_KEY) || ''; }
+function getRole() { return localStorage.getItem(ROLE_KEY)  || ''; }
+
+function setAuth(token, username, role){
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(ROLE_KEY, role);
+  localStorage.setItem('localai_user', username);
+  showUserBadge(username, role);
+}
+
+function clearAuth(){
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(ROLE_KEY);
+  localStorage.removeItem('localai_user');
+}
+
+function showUserBadge(username, role){
+  $('user-badge').style.display = '';
+  $('user-name').textContent = username + (role === 'admin' ? ' ★' : '');
+  $('logout-btn').style.display = '';
+  if(role === 'admin') $('admin-section').style.display = '';
+}
+
+// authFetch — обёртка fetch с автоматическим добавлением Bearer-токена.
+// При получении 401 показывает форму логина.
+async function authFetch(url, opts = {}){
+  const token = getToken();
+  const headers = Object.assign({}, opts.headers || {});
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  // Content-Type не задаём для FormData (браузер ставит автоматически с boundary)
+  if(!(opts.body instanceof FormData) && opts.method && opts.method !== 'GET'){
+    if(!headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  }
+  const resp = await fetch(url, Object.assign({}, opts, {headers}));
+  if(resp.status === 401){
+    clearAuth();
+    showAuthOverlay();
+    throw new Error('Сессия истекла. Войдите снова.');
+  }
+  return resp;
+}
+
+// initAuth проверяет статус авторизации при старте.
+async function initAuth(){
+  // Проверяем: нужна ли первичная настройка?
+  try{
+    const r = await fetch('/api/auth/status');
+    const d = await r.json();
+    if(d.needs_setup){
+      showSetupForm();
+      return false;
+    }
+  }catch{
+    // Если /api/auth/status недоступен — пробуем войти с текущим токеном
+  }
+
+  // Есть ли сохранённый токен?
+  const token = getToken();
+  if(!token){
+    showLoginForm();
+    return false;
+  }
+
+  // Проверяем токен через /api/auth/me
+  try{
+    const r = await authFetch('/api/auth/me');
+    if(r.ok){
+      const d = await r.json();
+      showUserBadge(d.username, d.role);
+      hideAuthOverlay();
+      return true;
+    }
+  }catch{}
+
+  // Токен невалиден
+  clearAuth();
+  showLoginForm();
+  return false;
+}
+
+function showAuthOverlay(){
+  $('auth-overlay').classList.add('on');
+}
+function hideAuthOverlay(){
+  $('auth-overlay').classList.remove('on');
+}
+function showLoginForm(){
+  showAuthOverlay();
+  $('auth-setup').style.display = 'none';
+  $('auth-login').style.display = 'flex';
+  $('auth-error').textContent = '';
+  setTimeout(()=>$('login-user').focus(), 50);
+}
+function showSetupForm(){
+  showAuthOverlay();
+  $('auth-login').style.display = 'none';
+  $('auth-setup').style.display = 'flex';
+  $('auth-error').textContent = '';
+  setTimeout(()=>$('setup-user').focus(), 50);
+}
+
+async function doLogin(){
+  const username = $('login-user').value.trim();
+  const password = $('login-pass').value;
+  $('auth-error').textContent = '';
+  if(!username || !password){ $('auth-error').textContent = 'Введи логин и пароль'; return; }
+  try{
+    const r = await fetch('/api/auth/login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const d = await r.json();
+    if(!r.ok){ $('auth-error').textContent = d.error || 'Ошибка входа'; return; }
+    setAuth(d.token, d.username, d.role);
+    hideAuthOverlay();
+    $('login-pass').value = '';
+    await loadApp();
+  }catch(e){ $('auth-error').textContent = e.message; }
+}
+
+async function doSetup(){
+  const username = $('setup-user').value.trim();
+  const password = $('setup-pass').value;
+  $('auth-error').textContent = '';
+  if(!username){ $('auth-error').textContent = 'Введи логин'; return; }
+  if(password.length < 6){ $('auth-error').textContent = 'Пароль должен быть не менее 6 символов'; return; }
+  try{
+    const r = await fetch('/api/auth/setup',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const d = await r.json();
+    if(!r.ok){ $('auth-error').textContent = d.error || 'Ошибка настройки'; return; }
+    setAuth(d.token, d.username, d.role);
+    hideAuthOverlay();
+    $('setup-pass').value = '';
+    await loadApp();
+  }catch(e){ $('auth-error').textContent = e.message; }
+}
+
+function logout(){
+  clearAuth();
+  $('user-badge').style.display = 'none';
+  $('logout-btn').style.display = 'none';
+  $('admin-section').style.display = 'none';
+  showLoginForm();
+}
+
+// Enter в полях авторизации
+document.addEventListener('keydown', e => {
+  if(e.key === 'Enter' && $('auth-overlay').classList.contains('on')){
+    if($('auth-login').style.display !== 'none') doLogin();
+    else if($('auth-setup').style.display !== 'none') doSetup();
+  }
+});
 
 // ── Подсветка кода ────────────────────────────────────────────────────
 const KW={go:'func|var|const|type|package|import|if|else|for|range|return|struct|interface|map|chan|go|defer|select|case|default|break|continue|nil|true|false|new|make|len|cap|append|copy|delete|panic|recover',python:'def|class|import|from|if|elif|else|for|while|return|True|False|None|and|or|not|in|is|lambda|with|as|try|except|finally|raise|yield|pass|break|continue|print|len|range',js:'function|var|let|const|if|else|for|while|return|true|false|null|undefined|new|this|typeof|class|extends|import|export|default|from|async|await|try|catch|throw|of|in|switch|case|break',bash:'if|then|else|elif|fi|for|while|do|done|case|esac|function|return|export|echo|exit|cd|grep|sed|awk|chmod|sudo'};
@@ -435,7 +673,8 @@ async function sendChat(text,model,temp){
   genStart=Date.now();genTokens=0;
 
   try{
-    const resp=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    const resp=await authFetch('/api/chat',{method:'POST',
+      headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:text,model,session_id:activeSid,temperature:temp,use_rag:true})});
     const reader=resp.body.getReader();const dec=new TextDecoder();let buf='';
     while(true){
@@ -474,7 +713,8 @@ async function sendAgent(text,model,temp){
 
   let finalAnswer='';
   try{
-    const resp=await fetch('/api/agent',{method:'POST',headers:{'Content-Type':'application/json'},
+    const resp=await authFetch('/api/agent',{method:'POST',
+      headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:text,model,session_id:'agent_'+activeSid,temperature:temp})});
     const reader=resp.body.getReader();const dec=new TextDecoder();let buf='';
     let firstStep=true;
@@ -517,7 +757,7 @@ function addTyping(){return addBubble('ai','<div class="typing"><i></i><i></i><i
 
 // ── Сессии ────────────────────────────────────────────────────────────
 async function loadSessions(){
-  try{const r=await fetch('/api/sessions');renderSessionList(await r.json());}catch{}
+  try{const r=await authFetch('/api/sessions');renderSessionList(await r.json());}catch{}
 }
 function renderSessionList(list){
   const el=$('sess-list');
@@ -534,7 +774,7 @@ async function openSession(sid){
   activeSid=sid;
   document.querySelectorAll('.sess-item').forEach(e=>e.classList.toggle('active',e.id==='si_'+sid));
   closeSidebar();
-  try{const r=await fetch('/api/sessions/'+sid);if(!r.ok)return;
+  try{const r=await authFetch('/api/sessions/'+sid);if(!r.ok)return;
     const sess=await r.json();renderMessages(sess.messages||[]);
     const sel=$('model-sel');if(sess.settings?.model)for(const o of sel.options)if(o.value===sess.settings.model){sel.value=o.value;break;}
     setStatus('Чат загружен · '+sess.title);
@@ -548,7 +788,7 @@ function renderMessages(msgs){
   }
   if(!$('messages').children.length)addBubble('ai','<p>Чем могу помочь?</p>');
 }
-async function delSession(e,sid){e.stopPropagation();await fetch('/api/sessions/'+sid,{method:'DELETE'});if(sid===activeSid)newSession();await loadSessions();}
+async function delSession(e,sid){e.stopPropagation();await authFetch('/api/sessions/'+sid,{method:'DELETE'});if(sid===activeSid)newSession();await loadSessions();}
 function newSession(){
   activeSid='sess_'+Math.random().toString(36).slice(2,10);
   $('messages').innerHTML='<div class="msg ai"><div class="av">🤖</div><div class="bubble"><p>Новый чат начат. Чем могу помочь?</p></div></div>';
@@ -559,7 +799,7 @@ function newSession(){
 // ── Документы (RAG) ───────────────────────────────────────────────────
 async function loadDocs(){
   try{
-    const r=await fetch('/api/docs');const docs=await r.json();
+    const r=await authFetch('/api/docs');const docs=await r.json();
     $('doc-count').textContent='('+docs.length+')';
     const el=$('doc-items');
     if(!docs||docs.length===0){el.innerHTML='<div class="aside-empty" style="padding:8px">Нет документов</div>';return;}
@@ -569,7 +809,7 @@ async function loadDocs(){
       <button class="doc-del" onclick="deleteDoc('${d.id}')">✕</button></div>`).join('');
   }catch{}
 }
-async function deleteDoc(id){await fetch('/api/docs/'+id,{method:'DELETE'});await loadDocs();}
+async function deleteDoc(id){await authFetch('/api/docs/'+id,{method:'DELETE'});await loadDocs();}
 function toggleDocs(){
   docsOpen=!docsOpen;
   $('doc-list').style.display=docsOpen?'':'none';
@@ -587,7 +827,8 @@ async function uploadFile(file){
   setStatus('📤 Загрузка: '+file.name+'…');
   const fd=new FormData();fd.append('file',file);
   try{
-    const r=await fetch('/api/upload',{method:'POST',body:fd});
+    // authFetch определяет FormData и не добавляет Content-Type
+    const r=await authFetch('/api/upload',{method:'POST',body:fd});
     if(!r.ok){const t=await r.text();setStatus('⚠ Ошибка: '+t);return;}
     const d=await r.json();
     setStatus(`✓ ${d.name} добавлен (${d.chunks} фрагментов)`);
@@ -607,7 +848,7 @@ document.addEventListener('drop',async e=>{
 // ── Модели ────────────────────────────────────────────────────────────
 async function loadModels(){
   try{
-    const r=await fetch('/api/models');const models=await r.json();
+    const r=await authFetch('/api/models');const models=await r.json();
     const sel=$('model-sel');const prev=sel.value;sel.innerHTML='';
     if(!models||models.length===0){sel.innerHTML='<option value="qwen2.5:0.5b">qwen2.5:0.5b</option>';setStatus('⚠ Нет моделей');return;}
     models.forEach(m=>{const mb=Math.round(m.size/1024/1024);const o=document.createElement('option');o.value=m.name;o.text=m.name+(mb?` (${mb}MB)`:'');sel.appendChild(o);});
@@ -616,7 +857,7 @@ async function loadModels(){
   }catch{setStatus('✗ Ollama недоступен');}
 }
 function plural(n,a,b,c){const m=n%10,h=n%100;return(m===1&&h!==11)?a:(m>=2&&m<=4&&(h<10||h>=20))?b:c;}
-function onModelChange(){const model=$('model-sel').value;if(!model||!activeSid)return;fetch('/api/sessions/'+activeSid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({model})}).catch(()=>{});}
+function onModelChange(){const model=$('model-sel').value;if(!model||!activeSid)return;authFetch('/api/sessions/'+activeSid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({model})}).catch(()=>{});}
 
 // ── Настройки ─────────────────────────────────────────────────────────
 const PRESETS={
@@ -627,12 +868,12 @@ const PRESETS={
 };
 function applyPreset(n){$('sp-prompt').value=PRESETS[n]||'';}
 async function openSettings(){
-  try{const r=await fetch('/api/sessions/'+activeSid);if(r.ok){const s=await r.json();
+  try{const r=await authFetch('/api/sessions/'+activeSid);if(r.ok){const s=await r.json();
     if(s.settings){$('sp-prompt').value=s.settings.system_prompt||PRESETS.assistant;$('sp-temp').value=s.settings.temperature||0.7;$('sp-temp-val').textContent=s.settings.temperature||0.7;}
     $('sp-title').value=s.title!=='Новый чат'?s.title:'';}
   }catch{}
   // Загружаем инструменты
-  try{const r=await fetch('/api/tools');const tools=await r.json();
+  try{const r=await authFetch('/api/tools');const tools=await r.json();
     $('tools-list').innerHTML=tools.map(t=>`<div>• <strong>${esc(t.name)}</strong> — ${esc(t.description)}</div>`).join('');
   }catch{$('tools-list').textContent='Ошибка загрузки';}
   $('settings-panel').classList.add('open');$('overlay').classList.add('on');
@@ -641,8 +882,25 @@ function closeSettings(){$('settings-panel').classList.remove('open');$('overlay
 async function saveSettings(){
   const patch={system_prompt:$('sp-prompt').value.trim(),temperature:parseFloat($('sp-temp').value),model:$('model-sel').value};
   const title=$('sp-title').value.trim();if(title)patch.title=title;
-  try{await fetch('/api/sessions/'+activeSid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});closeSettings();setStatus('✓ Настройки сохранены');await loadSessions();}
+  try{await authFetch('/api/sessions/'+activeSid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});closeSettings();setStatus('✓ Настройки сохранены');await loadSessions();}
   catch(e){setStatus('⚠ '+e.message);}
+}
+
+// ── Управление пользователями (admin) ────────────────────────────────
+async function createUser(){
+  const username=$('new-user').value.trim();
+  const password=$('new-pass').value;
+  const role=$('new-role').value;
+  if(!username||password.length<6){setStatus('⚠ Нужен логин и пароль (мин. 6 символов)');return;}
+  try{
+    const r=await authFetch('/api/auth/register',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,password,role})});
+    if(!r.ok){const d=await r.json();setStatus('⚠ '+d.error);return;}
+    const d=await r.json();
+    setStatus('✓ Пользователь создан: '+d.username+' ('+d.role+')');
+    $('new-user').value='';$('new-pass').value='';
+  }catch(e){setStatus('⚠ '+e.message);}
 }
 
 // ── Sidebar mobile ────────────────────────────────────────────────────
@@ -653,10 +911,19 @@ function closeSidebar(){$('sidebar').classList.remove('open');}
 $('input').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
 $('input').addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,130)+'px';});
 
+// ── Загрузка приложения после авторизации ────────────────────────────
+async function loadApp(){
+  await Promise.all([loadModels(), loadSessions(), loadDocs()]);
+  setInterval(loadModels, 30000);
+  setInterval(loadSessions, 12000);
+  $('input').focus();
+}
+
 // ── Инит ──────────────────────────────────────────────────────────────
-(async()=>{await loadModels();await loadSessions();await loadDocs();
-  setInterval(loadModels,30000);setInterval(loadSessions,12000);
-  $('input').focus();})();
+(async()=>{
+  const authed = await initAuth();
+  if(authed) await loadApp();
+})();
 </script>
 </body>
 </html>

@@ -8,68 +8,84 @@
 ## ФАЙЛОВАЯ КАРТА
 
 ```
-main.go       CLI точка входа. AppVersion="3.3.0". Команды: chat|serve|models|pull|config
-              Приоритет конфига: -flag > ENV > localai.yaml > DefaultConfig()
-              Флаги: -config -ollama -model -port -data -log
-config.go     AppConfig{OllamaURL,Model,Port,DataDir,...,LogFile,CacheEnabled,CacheTTLHours}
-              LoadConfig(path) → MergeEnv() → CLI-флаги
-              WriteExample(path) — создаёт localai.yaml
-logger.go     InitLogger(path) → error   — лог в файл + stderr, ротация >10MB → .gz
-              rotateSize=10MB  maxBackups=5   gzipFile / pruneBackups
-cache.go      LLMCache{dir,ttl}   InitCache(dataDir,ttl) → error
-              CacheKey(model,temp,messages) → sha256   CachedChat(ctx,client,...) → (string,bool,err)
-              globalCache *LLMCache   pruneLoop (фоновая горутина)   TTL по умолч. 1 час
-agent_pool.go BuiltinRoles: 12 ролей (coder,debugger,reviewer,planner,researcher,writer,
-              summarizer,critic,translator,analyst,math,security)
-              GetRole(name) / AllRoles() / SaveCustomRole / DeleteCustomRole
-              RunRoleAgent(ctx,client,role,task,model,stepCh) — специализированный вызов
-              InitAgentPool(dataDir) — загружает data/agents/*.json
-orchestrator.go OrchestrateTask(ctx,client,task,model,progressCh) → (string,error)
-              planTask → planner декомпозирует, runSubtask (параллельно), mergeResults
-              OrchestratorEvent{Kind,Message,Agent,Index,Total,Elapsed}
-os_exec.go    runCommand(name,args) → []byte,error
-              runCommandExists(name) → bool
-ollama.go     OllamaClient{baseURL,http}
-              ChatStreamWithTemp(ctx,msgs,model,temp) → (tokenCh,errCh)
-              ListModels() → []ModelInfo    IsAvailable() → bool
-storage.go    Session{SessionMeta{ID,Title,Settings,CreatedAt},Messages[]Message}
-              Storage.GetOrCreate / AppendAndSave / Load / Save / Delete / List
-compress.go   CompressHistory(ctx,client,msgs,model) → (msgs,bool,err)
-              TrimToTokenBudget(msgs,budget)   EstimateTokens(msgs) → int
-              maxHistoryMessages=24  keepRecentMessages=8  agentTokenBudget=3500
-tools.go      AllTools map[string]*ToolDef   RunTool(name,args) → (string,error)
-              ToolsPrompt() → string   (8 инструментов: +memory +agent_call)
-              SetMemoryDir(dataDir) / SetToolsClient(client,model)
-              memory: save|load|list|delete → data/memory/facts.json
-              agent_call: делегирует подзадачу роли → RunRoleAgent (init() регистрирует)
-agent.go      RunAgent(ctx,client,msgs,model,temp,stepCh) → (string,error)
-              ReAct-цикл: maxAgentSteps=8   AgentStep{Kind,Content,ToolName,...}
-rag.go        RAG.AddDocument(ctx,name,text) → (chunks,err)   [batch parallel ×4]
-              RAG.Search(ctx,query,topK) → []SearchResult   порог=0.3
-              BuildContextString(results) → string
-server.go     runServer(url,model,port,dataDir,cacheEnabled,cacheTTLHours)  v3.3
-              HTTP сервер с graceful shutdown (SIGTERM/SIGINT → 10s drain)
-              extractText: .pdf(pdftotext) .docx(stdlib ZIP+XML) .doc(antiword) .html(strip)
-              /api/sessions: фильтрует agent_ сессии; ?include_agent=true — показать все
-              /api/agents: список ролей агентов (?tag=code)
-              /api/multiagent: SSE OrchestrateTask (plan→parallel→merge)
-              /api/cache/stats: статистика кэша (hits/misses/entries/hit_rate)
-openai.go     registerOpenAIRoutes → GET /v1/models  POST /v1/chat/completions
-auth.go       UserStore(JSON)  HashPassword(PBKDF2-HMAC-SHA256-100k)
-              GenerateJWT / ValidateJWT (HS256, 24h)
-              RateLimiter(per-IP sliding window)
-              RequireAuth(secret) / RequireAdmin(secret) → http.Handler middleware
-audio.go      WhisperClient.Transcribe(ctx,file) → string   [proxy к Whisper HTTP]
-              PiperTTS.Synthesize(text,voice) → []byte      [exec piper binary]
-              registerAudioRoutes: /api/audio/transcriptions, /speech, /status
-balancer.go   OllamaBalancer: round-robin + circuit breaker (3 fails → down, 60s recovery)
-              NewOllamaBalancer(primaryURL) — читает LOCALAI_OLLAMA_NODES (запятая)
-              Pick() / ReportSuccess(client) / ReportFailure(client) / HealthyCount()
-              health check: каждые 15 сек в фоне
-metrics.go    NewMetrics(balancer) → *Metrics   registerMetricsRoute → GET /metrics
-              Prometheus text 0.0.4, 0 зависимостей
-              Счётчики: ChatReqs,AgentReqs,Tokens,Uploads,LoginOK,LoginFail,ChatErrs,AgentErrs
-              Гистограммы: ChatDuration,AgentDuration   Gauge: ActiveConns,HealthyNodes
+main.go            CLI точка входа. AppVersion="3.4.0". Команды: chat|serve|models|pull|config
+                   Приоритет конфига: -flag > ENV > localai.yaml > DefaultConfig()
+                   Флаги: -config -ollama -model -port -data -log
+config.go          AppConfig{OllamaURL,Model,Port,DataDir,...,LogFile,CacheEnabled,CacheTTLHours}
+                   LoadConfig(path) → MergeEnv() → CLI-флаги
+                   WriteExample(path) — создаёт localai.yaml
+logger.go          InitLogger(path) → error   — лог в файл + stderr, ротация >10MB → .gz
+                   rotateSize=10MB  maxBackups=5   gzipFile / pruneBackups
+cache.go           LLMCache{dir,ttl}   InitCache(dataDir,ttl) → error
+                   CacheKey(model,temp,messages) → sha256   CachedChat(ctx,client,...) → (string,bool,err)
+                   globalCache *LLMCache   pruneLoop (фоновая горутина)   TTL по умолч. 1 час
+agent_pool.go      BuiltinRoles: 12 ролей (coder,debugger,reviewer,planner,researcher,writer,
+                   summarizer,critic,translator,analyst,math,security)
+                   GetRole(name) / AllRoles() / SaveCustomRole / DeleteCustomRole
+                   RunRoleAgent(ctx,client,role,task,model,stepCh) — специализированный вызов
+                   InitAgentPool(dataDir) — загружает data/agents/*.json
+orchestrator.go    OrchestrateTask(ctx,client,task,model,progressCh) → (string,error)
+                   planTask → planner декомпозирует, runSubtask (параллельно), mergeResults
+                   OrchestratorEvent{Kind,Message,Agent,Index,Total,Elapsed}
+os_exec.go         runCommand(name,args) → []byte,error
+                   runCommandExists(name) → bool
+ollama.go          OllamaClient{baseURL,http}
+                   ChatStreamWithTemp(ctx,msgs,model,temp) → (tokenCh,errCh)
+                   ListModels() → []ModelInfo    IsAvailable() → bool
+storage.go         Session{SessionMeta{ID,Title,Settings,CreatedAt},Messages[]Message}
+                   Storage.GetOrCreate / AppendAndSave / Load / Save / Delete / List
+compress.go        CompressHistory(ctx,client,msgs,model) → (msgs,bool,err)
+                   TrimToTokenBudget(msgs,budget)   EstimateTokens(msgs) → int
+                   maxHistoryMessages=24  keepRecentMessages=8  agentTokenBudget=3500
+context_manager.go FilterByRelevance(messages,query,topN) → []Message   [TF keyword scoring]
+                   SmartContext(messages,query,budget,topN) → (msgs,origTok,filteredTok)
+                   tokenize(text) → map[string]bool   relevanceScore(content,queryWords) → float64
+                   defaultTopN=12  minWordLen=3  pairBonus=0.15  свежесть: +0.5 на последние 4
+templates.go       PromptTemplate{Name,Description,Prompt,Tokens}   TemplateInfo (листинг)
+                   GetTemplate(name) → (PromptTemplate,bool)   ListTemplates() → []TemplateInfo
+                   ApplyTemplate(messages,name) → []Message   — заменяет system prompt
+                   12 шаблонов: default,code,debug,review,explain,translate,brief,
+                                tutor,writer,analyst,security,devops
+token_stats.go     RecordCompression(before,after int)   RecordContextFilter(before,after)
+                   RecordTemplateUsage(saved int)   GetTokenStats() → TokenSavingsStats
+                   InitTokenStats(dataDir) — загружает/сохраняет data/token_stats.json
+                   globalTokenStats *tokenStatsState — атомарные счётчики, flush каждые 5 мин
+tools.go           AllTools map[string]*ToolDef   RunTool(name,args) → (string,error)
+                   ToolsPrompt() → string   (8 инструментов: +memory +agent_call)
+                   SetMemoryDir(dataDir) / SetToolsClient(client,model)
+                   memory: save|load|list|delete → data/memory/facts.json
+                   agent_call: делегирует подзадачу роли → RunRoleAgent (init() регистрирует)
+agent.go           RunAgent(ctx,client,msgs,model,temp,stepCh) → (string,error)
+                   ReAct-цикл: maxAgentSteps=8   AgentStep{Kind,Content,ToolName,...}
+rag.go             RAG.AddDocument(ctx,name,text) → (chunks,err)   [batch parallel ×4]
+                   RAG.Search(ctx,query,topK) → []SearchResult   порог=0.3
+                   BuildContextString(results) → string
+server.go          runServer(url,model,port,dataDir,cacheEnabled,cacheTTLHours)  v3.4
+                   HTTP сервер с graceful shutdown (SIGTERM/SIGINT → 10s drain)
+                   extractText: .pdf(pdftotext) .docx(stdlib ZIP+XML) .doc(antiword) .html(strip)
+                   /api/chat: +smart_context(bool) +template(string) → SmartContext/ApplyTemplate
+                   /api/sessions: фильтрует agent_ сессии; ?include_agent=true — показать все
+                   /api/agents: список ролей агентов (?tag=code)
+                   /api/multiagent: SSE OrchestrateTask (plan→parallel→merge)
+                   /api/cache/stats: статистика кэша (hits/misses/entries/hit_rate)
+                   /api/templates: GET список / GET /{name} полный шаблон
+                   /api/token-stats: сводка экономии токенов (compression/context/templates)
+openai.go          registerOpenAIRoutes → GET /v1/models  POST /v1/chat/completions
+auth.go            UserStore(JSON)  HashPassword(PBKDF2-HMAC-SHA256-100k)
+                   GenerateJWT / ValidateJWT (HS256, 24h)
+                   RateLimiter(per-IP sliding window)
+                   RequireAuth(secret) / RequireAdmin(secret) → http.Handler middleware
+audio.go           WhisperClient.Transcribe(ctx,file) → string   [proxy к Whisper HTTP]
+                   PiperTTS.Synthesize(text,voice) → []byte      [exec piper binary]
+                   registerAudioRoutes: /api/audio/transcriptions, /speech, /status
+balancer.go        OllamaBalancer: round-robin + circuit breaker (3 fails → down, 60s recovery)
+                   NewOllamaBalancer(primaryURL) — читает LOCALAI_OLLAMA_NODES (запятая)
+                   Pick() / ReportSuccess(client) / ReportFailure(client) / HealthyCount()
+                   health check: каждые 15 сек в фоне
+metrics.go         NewMetrics(balancer) → *Metrics   registerMetricsRoute → GET /metrics
+                   Prometheus text 0.0.4, 0 зависимостей
+                   Счётчики: ChatReqs,AgentReqs,Tokens,Uploads,LoginOK,LoginFail,ChatErrs,AgentErrs
+                   Гистограммы: ChatDuration,AgentDuration   Gauge: ActiveConns,HealthyNodes
 ```
 
 ---
